@@ -1,0 +1,466 @@
+// Package botapionotifier предоставляет реализацию PreparedSender на основе Telegram Bot API.
+//
+// В этом файле (bot_sender.go):
+//   - настраивается HTTP‑клиент и общий троттлер запросов;
+//   - реализуется последовательная доставка текста и, при необходимости, «копии» исходного сообщения;
+//   - классифицируются ошибки Bot API на временные (retry_after) и постоянные (большинство 4xx);
+//   - аккуратно извлекается retry_after из заголовков/тела и передается троттлеру через интерфейс.
+//
+// Бизнес‑логика совпадает с MTProto‑сендером: сначала обычный текст уведомления, затем копия,
+// никаких форвардов от имени бота. Random_id не используется, идемпотентность обеспечивается
+// повторным вызовом с теми же параметрами и корректным backoff.
+
+package botapionotifier
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"telegram-userbot/internal/domain/notifications"
+	"telegram-userbot/internal/infra/throttle"
+)
+
+// httpClientTimeout — таймаут HTTP‑клиента, секунды. Должен покрывать сетевые
+// колебания и не зависать бесконечно на медленных соединениях.
+const httpClientTimeout = 30
+
+// botSuperPrefix используется для построения chat_id каналов/супергрупп в Bot API.
+// Формула: chat_id = -100<channel_id>. Для обычных групп — просто отрицательный id.
+const botSuperPrefix int64 = -1000000000000
+
+// BotSender реализует notifications.PreparedSender поверх Telegram Bot API.
+//
+// Поля:
+//   - baseURL — конечная точка sendMessage для заданного бота (с учётом /test);
+//   - client  — HTTP‑клиент с умеренным таймаутом;
+//   - limiter — общий троттлер (token bucket) c поддержкой BotAPIRetryAfterExtractor.
+type BotSender struct {
+	baseURL string
+	client  *http.Client
+	limiter *throttle.Throttler
+}
+
+// NewBotSender создаёт PreparedSender для бота.
+//
+// Поведение:
+//   - при testDC=true добавляет суффикс /test к токену согласно Bot API;
+//   - формирует базовый URL вида https://api.telegram.org/bot<token>/sendMessage;
+//   - подключает троттлер с экстрактором BotAPIRetryAfterExtractor;
+//   - rps задаёт целевую среднюю частоту запросов.
+func NewBotSender(token string, testDC bool, rps int) *BotSender {
+	if testDC {
+		token += "/test"
+	}
+	base := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+
+	// Троттлер ограничивает частоту и уважает retry_after из ответов сервера.
+	limiter := throttle.New(
+		rps,
+		throttle.WithWaitExtractors(BotAPIRetryAfterExtractor()),
+	)
+
+	return &BotSender{
+		baseURL: base,
+		client: &http.Client{
+			Timeout: httpClientTimeout * time.Second,
+		},
+		limiter: limiter,
+	}
+}
+
+// Start подключает троттлер к жизненному циклу очереди.
+// Без запуска троттлер не выдаёт токены, Do() вернут ошибку ожидания.
+func (s *BotSender) Start(ctx context.Context) {
+	if s.limiter != nil {
+		s.limiter.Start(ctx)
+	}
+}
+
+// Stop завершает фоновые горутины троттлера и освобождает ресурсы.
+func (s *BotSender) Stop() {
+	if s.limiter != nil {
+		s.limiter.Stop()
+	}
+}
+
+// toBotChatID конвертирует доменного получателя в корректный chat_id для Bot API.
+// Пользователь → положительный id. Basic group → отрицательный id.
+// Канал/супергруппа → -100<id>. Функция не валидирует существование чата.
+func toBotChatID(r notifications.Recipient) int64 {
+	switch r.Type {
+	case notifications.RecipientTypeUser:
+		if r.ID < 0 {
+			return -r.ID
+		}
+		return r.ID
+	case notifications.RecipientTypeChat:
+		if r.ID > 0 {
+			return -r.ID
+		}
+		return r.ID
+	case notifications.RecipientTypeChannel:
+		if r.ID > 0 {
+			return botSuperPrefix - r.ID
+		}
+		return r.ID
+	default:
+		return r.ID
+	}
+}
+
+// Deliver последовательно отправляет уведомления каждому получателю (FIFO).
+// Если в payload включён Forward и подготовлена копия исходного сообщения (text+entities),
+// бот отправляет ДВА сообщения: (1) обычный текст уведомления и (2) копию исходного текста
+// с entities (не форвард). Такая последовательность совпадает с бизнес‑логикой клиента.
+// Возвращает aggregated outcome: Retry=true — нужна повторная попытка позже;
+// PermanentFailures — список чатов, для которых Bot API вернул постоянную 4xx‑ошибку.
+func (s *BotSender) Deliver(ctx context.Context, job notifications.Job) (notifications.SendOutcome, error) {
+	var outcome notifications.SendOutcome
+
+	// Предварительно вычисляем, что именно будем отправлять: обычный текст и/или «копию».
+	hasText := strings.TrimSpace(job.Payload.Text) != ""
+	hasCopy := job.Payload.Forward != nil &&
+		job.Payload.Forward.Enabled &&
+		job.Payload.Copy != nil &&
+		strings.TrimSpace(job.Payload.Copy.Text) != ""
+
+	// Идём по получателям в порядке очереди. Ошибки 4xx фиксируем и продолжаем, временные — прерываем на ретрай.
+	for _, recipient := range job.Recipients {
+		// 1) Сначала отправляем обычный текст уведомления, если он есть.
+		if hasText {
+			chatID := toBotChatID(recipient)
+			permanent, err := s.sendMessage(ctx, chatID, job.Payload.Text)
+			if err != nil {
+				if permanent {
+					outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+					outcome.PermanentError = errors.Join(outcome.PermanentError, err)
+					// Текст не доставлен этому получателю — переходим к следующему.
+					continue
+				}
+				// Временная ошибка — прерываем обработку всего job на ретрай.
+				outcome.Retry = true
+				return outcome, err
+			}
+		}
+
+		// 2) Затем, если включён forward и подготовлена копия — отправляем копию исходного сообщения.
+		if hasCopy {
+			chatID := toBotChatID(recipient)
+			permanent, err := s.sendMessageRich(ctx, chatID, job.Payload.Copy.Text, job.Payload.Copy.Entities)
+			if err != nil {
+				if permanent {
+					outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+					outcome.PermanentError = errors.Join(outcome.PermanentError, err)
+					continue
+				}
+				outcome.Retry = true
+				return outcome, err
+			}
+		}
+	}
+
+	return outcome, nil
+}
+
+// sendMessage выполняет GET /sendMessage с минимальным набором полей.
+// Возвращает (permanent, err):
+//
+//   - permanent=true, err!=nil  — ошибка 4xx, адресат фиксируется как постоянная неудача;
+//   - permanent=false, err!=nil — временная ошибка или сетевой сбой (в том числе retry_after);
+//   - permanent=false, err==nil — успех.
+//
+// При наличии троттлера запрос выполняется внутри limiter.Do().
+func (s *BotSender) sendMessage(ctx context.Context, chatID int64, text string) (bool, error) {
+	if s.limiter == nil {
+		return s.performSend(ctx, chatID, text)
+	}
+
+	var permanent bool
+	var requestErr error
+
+	err := s.limiter.Do(ctx, func() error {
+		var sendErr error
+		permanent, sendErr = s.performSend(ctx, chatID, text)
+		requestErr = sendErr
+		if sendErr == nil {
+			return nil
+		}
+		if permanent {
+			return &stopRetryError{err: sendErr}
+		}
+		return sendErr
+	})
+	if err != nil {
+		if permanent {
+			return true, requestErr
+		}
+		return false, err
+	}
+
+	return false, nil
+}
+
+// performSend выполняет запрос без троттлера. Обрабатывает HTTP/JSON ответы и
+// приводит их к паре (permanent, error).
+func (s *BotSender) performSend(ctx context.Context, chatID int64, text string) (bool, error) {
+	params := url.Values{}
+	params.Set("chat_id", strconv.FormatInt(chatID, 10))
+	params.Set("text", text)
+	params.Set("disable_web_page_preview", "true")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"?"+params.Encode(), nil)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return handleHTTPError(resp, body)
+	}
+
+	return handleJSONResponse(body)
+}
+
+// sendMessageRich отправляет текст с entities (Bot API), сохраняя тот же троттлинг.
+// Используется после успешной доставки обычного текста, если включён режим «копии».
+func (s *BotSender) sendMessageRich(
+	ctx context.Context, chatID int64, text string,
+	entities []notifications.CopyEntity,
+) (bool, error) {
+	if s.limiter == nil {
+		return s.performSendRich(ctx, chatID, text, entities)
+	}
+	var permanent bool
+	var sendErr error
+	// Выполняем под троттлером
+	err := s.limiter.Do(ctx, func() error {
+		var errDo error
+		permanent, errDo = s.performSendRich(ctx, chatID, text, entities)
+		return errDo
+	})
+	if err != nil {
+		return permanent, err
+	}
+	return permanent, sendErr
+}
+
+// performSendRich делает POST JSON на /sendMessage с полем entities.
+//
+// Замечания:
+//   - Content-Type: application/json;
+//   - DisableWebPagePreview=true, чтобы не было лишних превью;
+//   - BODY формируется через json.Marshal. TODO: можно заменить strings.NewReader(string(body)) на bytes.NewReader(body).
+func (s *BotSender) performSendRich(
+	ctx context.Context, chatID int64, text string,
+	entities []notifications.CopyEntity,
+) (bool, error) {
+	payload := struct {
+		ChatID                int64                      `json:"chat_id"`
+		Text                  string                     `json:"text"`
+		Entities              []notifications.CopyEntity `json:"entities,omitempty"`
+		DisableWebPagePreview bool                       `json:"disable_web_page_preview,omitempty"`
+	}{
+		ChatID:                chatID,
+		Text:                  text,
+		Entities:              entities,
+		DisableWebPagePreview: true,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL, strings.NewReader(string(body)))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return handleHTTPError(resp, respBody)
+	}
+	return handleJSONResponse(respBody)
+}
+
+// handleHTTPError нормализует не-200 ответы HTTP в (permanent, error).
+// 429: пытается извлечь Retry-After из заголовка или JSON-тела и возвращает retryAfterError;
+// 4xx: постоянная ошибка; 5xx: временная ошибка.
+func handleHTTPError(resp *http.Response, body []byte) (bool, error) {
+	status := resp.StatusCode
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		msg = http.StatusText(status)
+	}
+
+	switch {
+	case status == http.StatusTooManyRequests:
+		wait := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
+		if wait <= 0 {
+			wait = parseRetryAfterBody(body)
+		}
+		baseErr := fmt.Errorf("bot api rate limit (%d): %s", status, msg)
+		if wait > 0 {
+			return false, &retryAfterError{err: baseErr, wait: wait}
+		}
+		return false, baseErr
+	case status >= 400 && status < 500:
+		return true, fmt.Errorf("bot api client error (%d): %s", status, msg)
+	default:
+		return false, fmt.Errorf("bot api server error (%d): %s", status, msg)
+	}
+}
+
+// handleJSONResponse разбирает JSON Bot API. Возвращает (permanent, error)
+// по тем же правилам, учитывая parameters.retry_after.
+func handleJSONResponse(body []byte) (bool, error) {
+	var apiResp struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		ErrorCode   int    `json:"error_code"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return false, fmt.Errorf("bot api decode response: %w", err)
+	}
+
+	if apiResp.OK {
+		return false, nil
+	}
+
+	msg := strings.TrimSpace(apiResp.Description)
+	if msg == "" {
+		msg = "(empty bot api description)"
+	}
+
+	wait := time.Duration(apiResp.Parameters.RetryAfter) * time.Second
+	if apiResp.ErrorCode == http.StatusTooManyRequests || wait > 0 {
+		if wait <= 0 {
+			wait = time.Second
+		}
+		baseErr := fmt.Errorf("bot api rate limit (%d): %s", apiResp.ErrorCode, msg)
+		return false, &retryAfterError{err: baseErr, wait: wait}
+	}
+
+	if isPermanentBotError(apiResp.ErrorCode, apiResp.Description) {
+		return true, fmt.Errorf("bot api error %d: %s", apiResp.ErrorCode, msg)
+	}
+
+	return false, fmt.Errorf("bot api error %d: %s", apiResp.ErrorCode, msg)
+}
+
+// parseRetryAfterHeader парсит Retry-After из заголовка: либо число секунд, либо абсолютную дату.
+// Возвращает 0, если значение отсутствует или некорректно.
+func parseRetryAfterHeader(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+
+	if ts, err := http.ParseTime(value); err == nil {
+		delta := time.Until(ts)
+		if delta > 0 {
+			return delta
+		}
+	}
+
+	return 0
+}
+
+// parseRetryAfterBody извлекает parameters.retry_after из JSON тела. Нулевое или отрицательное — как отсутствие.
+func parseRetryAfterBody(body []byte) time.Duration {
+	var payload struct {
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0
+	}
+	if payload.Parameters.RetryAfter <= 0 {
+		return 0
+	}
+	return time.Duration(payload.Parameters.RetryAfter) * time.Second
+}
+
+// isPermanentBotError анализирует JSON-ответ Bot API: большинство 4xx — постоянные ошибки,
+// но retry_after сигнализирует о временном сбое. Проверка остаётся на случай нестандартных сообщений.
+func isPermanentBotError(code int, desc string) bool {
+	if code == http.StatusTooManyRequests {
+		return false
+	}
+	desc = strings.ToLower(desc)
+	if strings.Contains(desc, "retry_after") || strings.Contains(desc, "retry after") {
+		return false
+	}
+	return code >= 400 && code < 500
+}
+
+// retryAfterError — ошибка-носитель retry_after для экстрактора ожиданий.
+// Реализует интерфейс retryAfterProvider.
+type retryAfterError struct {
+	err  error
+	wait time.Duration
+}
+
+func (e *retryAfterError) Error() string {
+	return e.err.Error()
+}
+
+func (e *retryAfterError) Unwrap() error {
+	return e.err
+}
+
+func (e *retryAfterError) RetryAfter() time.Duration {
+	return e.wait
+}
+
+// stopRetryError — маркер для прекращения ретраев на уровне очереди.
+// Используется, когда ошибка постоянна для конкретного адресата.
+type stopRetryError struct {
+	err error
+}
+
+func (e *stopRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *stopRetryError) Unwrap() error {
+	return e.err
+}
+
+func (e *stopRetryError) StopRetry() bool {
+	return true
+}

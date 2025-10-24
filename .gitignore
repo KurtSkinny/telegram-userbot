@@ -1,0 +1,17 @@
+*
+
+!*/
+/bin/
+/data/
+
+!.gitignore
+!*.go
+!/go.mod
+!/go.sum
+!/.golangci.yml
+!/README.md
+!/LICENSE
+!/assets/*.example
+!/Makefile
+
+/z-*
