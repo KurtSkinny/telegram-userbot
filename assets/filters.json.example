@@ -6,7 +6,7 @@
       "match": {
         "keywords_any": ["any","keyword"],
         "keywords_all": ["all", "keywords", "at", "once"],
-        "regex": "some\s?regex",
+        "regex": "(?i)some\\s?regex",
         "exclude_any": ["white", "black"],
         "exclude_regex": "\\s(papper|coffie)\\s"
       },
