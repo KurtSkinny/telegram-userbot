@@ -31,8 +31,8 @@ package filters
 import (
 	"regexp"
 	"slices"
-	"unicode"
 
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 
@@ -71,7 +71,7 @@ func ProcessMessage(
 	entities tg.Entities,
 	msg *tg.Message,
 ) []FilterMatchResult {
-	peerKey := GetPeerID(msg.PeerID)
+	peerKey := tgutil.GetPeerID(msg.PeerID)
 
 	var results []FilterMatchResult
 
@@ -261,24 +261,4 @@ func ContainsSmart(text, kw string) bool {
 	pattern := `(?i)(^|[^\p{L}\p{N}])` + regexp.QuoteMeta(kw) + `([^\p{L}\p{N}]|$)`
 	re := regexp.MustCompile(pattern)
 	return re.FindStringIndex(text) != nil
-}
-
-// GetPeerID нормализует получателя до его числового идентификатора (user/chat/channel).
-// Возвращает 0 для неизвестного типа peer. Удобно для сопоставления фильтров по chat‑whitelist.
-func GetPeerID(peer tg.PeerClass) int64 {
-	switch p := peer.(type) {
-	case *tg.PeerUser:
-		return p.UserID
-	case *tg.PeerChat:
-		return p.ChatID
-	case *tg.PeerChannel:
-		return p.ChannelID
-	default:
-		return 0
-	}
-}
-
-// isAlphaNum возвращает true для букв и цифр в Unicode. Используется при токенизации и проверках границ.
-func isAlphaNum(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsNumber(r)
 }

@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"telegram-userbot/internal/domain/filters"
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/storage"
 
@@ -183,7 +183,7 @@ func (h *Handlers) flushNotifiedNow() {
 // уведомлена ранее. Ключ строится как "<peerID>:<msgID>:<filterID>". Доступ к
 // карте защищён h.mu.
 func (h *Handlers) hasNotified(msg *tg.Message, filterID string) bool {
-	key := fmt.Sprintf("%d:%d:%s", filters.GetPeerID(msg.PeerID), msg.ID, filterID)
+	key := fmt.Sprintf("%d:%d:%s", tgutil.GetPeerID(msg.PeerID), msg.ID, filterID)
 
 	h.mu.Lock()
 	_, hasNotified := h.notified[key]
@@ -196,7 +196,7 @@ func (h *Handlers) hasNotified(msg *tg.Message, filterID string) bool {
 // уведомлений. Вызывать после успешной постановки, иначе возможны ложные
 // «уже отправлено». Помечает кэш как грязный и планирует отложенный флаш на диск.
 func (h *Handlers) markNotified(msg *tg.Message, filterID string) {
-	key := fmt.Sprintf("%d:%d:%s", filters.GetPeerID(msg.PeerID), msg.ID, filterID)
+	key := fmt.Sprintf("%d:%d:%s", tgutil.GetPeerID(msg.PeerID), msg.ID, filterID)
 
 	h.mu.Lock()
 	h.notified[key] = time.Now()

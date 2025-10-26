@@ -15,7 +15,7 @@ import (
 	"slices"
 	"time"
 
-	"telegram-userbot/internal/domain/filters"
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/cache"
@@ -163,7 +163,7 @@ func (h *Handlers) markRead(ctx context.Context, entities tg.Entities, msg *tg.M
 		return
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	switch p := peer.(type) {
 	case *tg.InputPeerUser, *tg.InputPeerChat:

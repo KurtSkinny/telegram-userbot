@@ -19,6 +19,7 @@ import (
 
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/cache"
@@ -157,7 +158,7 @@ func (h *Handlers) OnNewMessage(
 		return nil
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
@@ -214,7 +215,7 @@ func (h *Handlers) OnNewChannelMessage(
 		return nil
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
@@ -262,7 +263,7 @@ func (h *Handlers) OnEditMessage(
 	debug.PrintUpdate("OnEditMessage", msg, entities)
 	// Дебаунсим лавину апдейтов при частых правках одного и того же сообщения.
 	h.debouncer.Do(msg.ID, func() {
-		if !h.dupCache.DedupSeen(filters.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
 			results := filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
@@ -295,7 +296,7 @@ func (h *Handlers) OnEditChannelMessage(
 	debug.PrintUpdate("OnEditChannelMessage", msg, entities)
 	// Дебаунсим частые правки сообщений канала, чтобы не заспамить очередь.
 	h.debouncer.Do(msg.ID, func() {
-		if !h.dupCache.DedupSeen(filters.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
 			results := filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
