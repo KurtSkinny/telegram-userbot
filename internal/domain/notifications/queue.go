@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/infra/config"
+	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
 
@@ -738,7 +738,7 @@ func (q *Queue) previousScheduleAt(now time.Time) time.Time {
 }
 
 // buildRecipientsFromTargets собирает получателей из users/chats/channels и устраняет дубликаты по (Type, ID).
-func buildRecipientsFromTargets(t config.RecipientTargets) []Recipient {
+func buildRecipientsFromTargets(t recipients.RecipientTargets) []Recipient {
 	total := len(t.Users) + len(t.Chats) + len(t.Channels)
 	out := make([]Recipient, 0, total)
 	seen := make(map[string]struct{}, total)

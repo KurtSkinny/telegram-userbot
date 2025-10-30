@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"telegram-userbot/internal/domain/tgutil"
-	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
@@ -87,7 +86,7 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 
 	for peerID, maxID := range h.unread {
 		// Уважаем белый список: если чат не разрешён конфигурацией, очищаем запись и пропускаем.
-		if !slices.Contains(config.UniqueChats(), peerID) {
+		if !slices.Contains(h.filters.GetUniqueChats(), peerID) {
 			delete(h.unread, peerID)
 			continue
 		}

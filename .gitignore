@@ -3,6 +3,8 @@
 !*/
 /bin/
 /data/
+/.git/
+/.gocache/
 
 !.gitignore
 !*.go

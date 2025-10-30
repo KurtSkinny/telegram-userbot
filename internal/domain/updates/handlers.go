@@ -42,6 +42,7 @@ import (
 //   - фоновую очистку устаревших отметок notified и периодический сброс их на диск.
 type Handlers struct {
 	api       *tg.Client                // api предоставляет доступ к TDLib-клиенту для служебных запросов
+	filters   *filters.FilterEngine     // filters содержит движок фильтров для матчинга сообщений
 	notif     *notifications.Queue      // notif отвечает за доставку уведомлений конечному пользователю
 	notified  map[string]time.Time      // notified запоминает, какие комбинации «сообщение-фильтр» уже уведомлялись
 	mu        sync.Mutex                // mu защищает доступ к карте notified в конкурентной среде
@@ -70,12 +71,13 @@ type Handlers struct {
 //   - NotifiedCacheFile — путь файла для периодического флаша notified-кэша.
 //
 // Возвращает полностью инициализированную структуру без запуска фоновых горутин.
-func NewHandlers(api *tg.Client, notif *notifications.Queue,
+func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
 	dup *concurrency.Deduplicator, debouncer *concurrency.Debouncer,
 	shutdown func()) *Handlers {
 	cfg := config.Env()
 	return &Handlers{
 		api:               api,
+		filters:           filters,
 		notif:             notif,
 		notified:          make(map[string]time.Time),
 		dupCache:          dup,
@@ -185,7 +187,7 @@ func (h *Handlers) OnNewMessage(
 
 	logger.Debug("OnNewMessage")
 	debug.PrintUpdate("DM/Group", msg, entities)
-	results := filters.ProcessMessage(entities, msg)
+	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
@@ -228,7 +230,7 @@ func (h *Handlers) OnNewChannelMessage(
 	}
 	logger.Debug("OnNewChannelMessage")
 	debug.PrintUpdate("Channel", msg, entities)
-	results := filters.ProcessMessage(entities, msg)
+	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
@@ -264,7 +266,7 @@ func (h *Handlers) OnEditMessage(
 	// Дебаунсим лавину апдейтов при частых правках одного и того же сообщения.
 	h.debouncer.Do(msg.ID, func() {
 		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
-			results := filters.ProcessMessage(entities, msg)
+			results := h.filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue
@@ -297,7 +299,7 @@ func (h *Handlers) OnEditChannelMessage(
 	// Дебаунсим частые правки сообщений канала, чтобы не заспамить очередь.
 	h.debouncer.Do(msg.ID, func() {
 		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
-			results := filters.ProcessMessage(entities, msg)
+			results := h.filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue

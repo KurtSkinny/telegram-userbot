@@ -14,6 +14,7 @@ import (
 
 	"telegram-userbot/internal/adapters/cli"
 	"telegram-userbot/internal/adapters/telegram/core"
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	domainupdates "telegram-userbot/internal/domain/updates"
 	"telegram-userbot/internal/infra/concurrency"
@@ -36,13 +37,14 @@ import (
 //   - корректное завершение: сначала останавливаются узлы (статусы/очереди), затем гасится MTProto‑движок,
 //   - интеграцию с CLI и доменными обработчиками обновлений.
 type Runner struct {
-	cl    *core.ClientCore          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
-	notif *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
-	dedup *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
-	deb   *concurrency.Debouncer    // Сглаживание/слияние частых событий (например, всплесков апдейтов).
-	h     *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
-	ctx   context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
-	stop  context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
+	cl      *core.ClientCore          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
+	filters *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
+	notif   *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
+	dedup   *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
+	deb     *concurrency.Debouncer    // Сглаживание/слияние частых событий (например, всплесков апдейтов).
+	h       *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
+	ctx     context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
+	stop    context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
 }
 
 // NewRunner подготавливает Runner с переданными зависимостями: ядро клиента, очередь уведомлений,
@@ -51,19 +53,21 @@ func NewRunner(
 	ctx context.Context,
 	stop context.CancelFunc,
 	cl *core.ClientCore,
+	filters *filters.FilterEngine,
 	notif *notifications.Queue,
 	dedup *concurrency.Deduplicator,
 	debouncer *concurrency.Debouncer,
 	handlers *domainupdates.Handlers,
 ) *Runner {
 	return &Runner{
-		ctx:   ctx,
-		stop:  stop,
-		cl:    cl,
-		notif: notif,
-		dedup: dedup,
-		deb:   debouncer,
-		h:     handlers,
+		ctx:     ctx,
+		stop:    stop,
+		cl:      cl,
+		filters: filters,
+		notif:   notif,
+		dedup:   dedup,
+		deb:     debouncer,
+		h:       handlers,
 	}
 }
 
@@ -358,7 +362,7 @@ func (r *Runner) registerClientNodes(
 
 	// Узел: cli
 	// Сервис интерактивных команд. Не блокирует основную петлю, но может инициировать shutdown через r.stop().
-	cliService := cli.NewService(r.cl, r.stop, r.notif)
+	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif)
 	if err := lc.Register(
 		"cli",
 		"",

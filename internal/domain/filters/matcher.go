@@ -33,7 +33,6 @@ import (
 	"slices"
 
 	"telegram-userbot/internal/domain/tgutil"
-	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 
 	"github.com/gotd/td/tg"
@@ -55,7 +54,7 @@ type Result struct {
 // Используется для логирования и дальнейшей бизнес‑обработки
 // (например, выбор действия согласно типу фильтра).
 type FilterMatchResult struct {
-	Filter config.Filter
+	Filter Filter
 	Result Result
 }
 
@@ -67,7 +66,7 @@ type FilterMatchResult struct {
 //   - entities переданы на будущее (ссылки, хэштеги и т. п.) и сейчас не используются;
 //   - порядок результатов соответствует порядку фильтров в конфиге;
 //   - пустой текст сообщения допустим: все include‑условия должны его выдержать, чтобы фильтр сработал.
-func ProcessMessage(
+func (fe *FilterEngine) ProcessMessage(
 	entities tg.Entities,
 	msg *tg.Message,
 ) []FilterMatchResult {
@@ -75,7 +74,7 @@ func ProcessMessage(
 
 	var results []FilterMatchResult
 
-	for _, f := range config.Filters() {
+	for _, f := range fe.GetFilters() {
 		hasChat := slices.Contains(f.Chats, peerKey)
 		if !hasChat {
 			continue
@@ -103,7 +102,7 @@ func ProcessMessage(
 //   - ошибки компиляции regexp приводят к возврату пустого Result и логируются;
 //   - возвращаемый Result.Matched выставляется только в случае успешного прохождения всех стадий;
 //   - Result.Keywords содержит объединённый список совпавших ключей из All и Any без дубликатов по позиции.
-func MatchMessage(text string, f config.Filter) Result {
+func MatchMessage(text string, f Filter) Result {
 	result := Result{}
 
 	if matched, ok, err := includeRegex(text, f.Match.Regex); ok {

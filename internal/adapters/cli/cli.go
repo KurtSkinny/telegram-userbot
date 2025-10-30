@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"telegram-userbot/internal/adapters/telegram/core"
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
@@ -52,20 +53,26 @@ var (
 // и синхронно закрывается через Stop(). Потокобезопасность обеспечивается
 // дисциплиной запуска/остановки и отсутствием внешних мутаций.
 type Service struct {
-	cl        *core.ClientCore     // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
-	stopApp   context.CancelFunc   // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
-	notif     *notifications.Queue // очередь уведомлений; нужна для flush/status
-	cancel    context.CancelFunc   // локальная отмена run-цикла CLI
-	wg        sync.WaitGroup       // ожидание завершения фоновой горутины run
-	onceStart sync.Once            // идемпотентный запуск
-	onceStop  sync.Once            // идемпотентная остановка
+	cl        *core.ClientCore      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
+	stopApp   context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
+	filters   *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
+	notif     *notifications.Queue  // очередь уведомлений; нужна для flush/status
+	cancel    context.CancelFunc    // локальная отмена run-цикла CLI
+	wg        sync.WaitGroup        // ожидание завершения фоновой горутины run
+	onceStart sync.Once             // идемпотентный запуск
+	onceStop  sync.Once             // идемпотентная остановка
 }
 
 // NewService создаёт CLI-сервис. Параметр stopApp используется как «глобальная»
 // остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
 // команда "flush" инициирует внеочередной слив регулярной очереди уведомлений.
-func NewService(cl *core.ClientCore, stopApp context.CancelFunc, notif *notifications.Queue) *Service {
-	return &Service{cl: cl, stopApp: stopApp, notif: notif}
+func NewService(
+	cl *core.ClientCore,
+	stopApp context.CancelFunc,
+	filterEngine *filters.FilterEngine,
+	notif *notifications.Queue,
+) *Service {
+	return &Service{cl: cl, stopApp: stopApp, filters: filterEngine, notif: notif}
 }
 
 // Start запускает основной цикл CLI в отдельной горутине. Повторные вызовы
@@ -196,7 +203,7 @@ func (s *Service) handleCommand(cmd string) bool {
 		pr.Println("Fetching dialogs...")
 		listDialogs()
 	case "reload":
-		if err := config.LoadFilters(); err != nil {
+		if err := s.filters.GetFilters(); err != nil {
 			pr.ErrPrintln("reload error:", err)
 		} else {
 			pr.Println("filters.json reloaded")

@@ -12,6 +12,7 @@ import (
 	botapionotifier "telegram-userbot/internal/adapters/botapi/notifier"
 	"telegram-userbot/internal/adapters/telegram/core"
 	telegramnotifier "telegram-userbot/internal/adapters/telegram/notifier"
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	domainupdates "telegram-userbot/internal/domain/updates"
 	"telegram-userbot/internal/infra/concurrency"
@@ -37,6 +38,7 @@ import (
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
 	cl        *core.ClientCore          // Авторизованный клиент gotd и его API-обёртка (Self, вызовы tg).
+	filters   *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
 	dupCache  *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).
 	debouncer *concurrency.Debouncer    // Сглаживание бурстов (частые правки одного сообщения и т.п.).
@@ -118,6 +120,14 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	// Инициализация кэша пиров: ускоряет резолв пользователей/диалогов в обработчиках.
 	cache.Init(ctx, cl.API)
 
+	// Инициализация и загрузка фильтров
+	a.filters = filters.NewFilterEngine(config.Env().FiltersFile)
+	if err := a.filters.Load(); err != nil {
+		return fmt.Errorf("load filters: %w", err)
+	}
+	logger.Infof("Filters loaded: %d total, %d unique chats",
+		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
+
 	// 4) Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
 	if err != nil {
@@ -164,7 +174,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
 
 	// 6) Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
-	h := domainupdates.NewHandlers(cl.API, a.notif, a.dupCache, a.debouncer, a.stop)
+	h := domainupdates.NewHandlers(cl.API, a.filters, a.notif, a.dupCache, a.debouncer, a.stop)
 	a.handlers = h
 
 	// Маршрутизация апдейтов на доменные обработчики.
@@ -174,7 +184,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.dispatch.OnEditChannelMessage(h.OnEditChannelMessage)
 
 	// 7) Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
-	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.notif, a.dupCache, a.debouncer, a.handlers)
+	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers)
 
 	return nil
 }

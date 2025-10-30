@@ -14,11 +14,9 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,126 +52,127 @@ type EnvConfig struct {
 	NotifySchedule    []string
 	NotifiedCacheFile string
 	NotifiedTTLDays   int
+	FiltersFile       string
 }
 
-// Match описывает правила совпадения входящих сообщений. Движок фильтрации
-// трактует условие как И/ИЛИ/регексп в зависимости от полей:
-//   - KeywordsAny: достаточно совпадения по ЛЮБОМУ из слов
-//   - KeywordsAll: требуется совпадение по ВСЕМ словам
-//   - Regex: проверка произвольным регулярным выражением
-//   - ExcludeKeywordsAny / ExcludeRegex: выколотые множества для отрицания
-//
-// Совпадение считается успехом, если выполняется хотя бы одно «положительное»
-// условие и одновременно не срабатывает ни одно исключающее.
-type Match struct {
-	KeywordsAny        []string `json:"keywords_any"`
-	KeywordsAll        []string `json:"keywords_all"`
-	Regex              string   `json:"regex"`
-	ExcludeKeywordsAny []string `json:"exclude_any"`
-	ExcludeRegex       string   `json:"exclude_regex"`
-}
+// // Match описывает правила совпадения входящих сообщений. Движок фильтрации
+// // трактует условие как И/ИЛИ/регексп в зависимости от полей:
+// //   - KeywordsAny: достаточно совпадения по ЛЮБОМУ из слов
+// //   - KeywordsAll: требуется совпадение по ВСЕМ словам
+// //   - Regex: проверка произвольным регулярным выражением
+// //   - ExcludeKeywordsAny / ExcludeRegex: выколотые множества для отрицания
+// //
+// // Совпадение считается успехом, если выполняется хотя бы одно «положительное»
+// // условие и одновременно не срабатывает ни одно исключающее.
+// type Match struct {
+// 	KeywordsAny        []string `json:"keywords_any"`
+// 	KeywordsAll        []string `json:"keywords_all"`
+// 	Regex              string   `json:"regex"`
+// 	ExcludeKeywordsAny []string `json:"exclude_any"`
+// 	ExcludeRegex       string   `json:"exclude_regex"`
+// }
 
-// RecipientTargets поддерживает два формата конфигурации получателей:
-//  1. исторический плоский массив []int64 (трактуется как Users),
-//  2. новый объект с раздельными полями users/chats/channels.
-//
-// Метод UnmarshalJSON обеспечивает обратную совместимость и устраняет
-// нули/дубликаты, сохраняя порядок первых вхождений.
-type RecipientTargets struct {
-	Users    []int64 `json:"users"`
-	Chats    []int64 `json:"chats"`
-	Channels []int64 `json:"channels"`
-}
+// // RecipientTargets поддерживает два формата конфигурации получателей:
+// //  1. исторический плоский массив []int64 (трактуется как Users),
+// //  2. новый объект с раздельными полями users/chats/channels.
+// //
+// // Метод UnmarshalJSON обеспечивает обратную совместимость и устраняет
+// // нули/дубликаты, сохраняя порядок первых вхождений.
+// type RecipientTargets struct {
+// 	Users    []int64 `json:"users"`
+// 	Chats    []int64 `json:"chats"`
+// 	Channels []int64 `json:"channels"`
+// }
 
-// UnmarshalJSON реализует особую десериализацию для RecipientTargets:
-// пытается распарсить вход как []int64; если не получилось — как объект
-// {users, chats, channels}. Нули и повторы удаляются, чтобы избежать кривых
-// адресатов в рантайме при доставке уведомлений.
-func (r *RecipientTargets) UnmarshalJSON(b []byte) error {
-	// Попытка распарсить как старый формат: []int64
-	var flat []int64
-	if err := json.Unmarshal(b, &flat); err == nil {
-		r.Users = uniqueNonZero(flat)
-		r.Chats = nil
-		r.Channels = nil
-		return nil
-	}
-	// Пробуем новый формат: объект
-	var tmp struct {
-		Users    []int64 `json:"users"`
-		Chats    []int64 `json:"chats"`
-		Channels []int64 `json:"channels"`
-	}
-	if err := json.Unmarshal(b, &tmp); err != nil {
-		return err
-	}
-	r.Users = uniqueNonZero(tmp.Users)
-	r.Chats = uniqueNonZero(tmp.Chats)
-	r.Channels = uniqueNonZero(tmp.Channels)
-	return nil
-}
+// // UnmarshalJSON реализует особую десериализацию для RecipientTargets:
+// // пытается распарсить вход как []int64; если не получилось — как объект
+// // {users, chats, channels}. Нули и повторы удаляются, чтобы избежать кривых
+// // адресатов в рантайме при доставке уведомлений.
+// func (r *RecipientTargets) UnmarshalJSON(b []byte) error {
+// 	// Попытка распарсить как старый формат: []int64
+// 	var flat []int64
+// 	if err := json.Unmarshal(b, &flat); err == nil {
+// 		r.Users = uniqueNonZero(flat)
+// 		r.Chats = nil
+// 		r.Channels = nil
+// 		return nil
+// 	}
+// 	// Пробуем новый формат: объект
+// 	var tmp struct {
+// 		Users    []int64 `json:"users"`
+// 		Chats    []int64 `json:"chats"`
+// 		Channels []int64 `json:"channels"`
+// 	}
+// 	if err := json.Unmarshal(b, &tmp); err != nil {
+// 		return err
+// 	}
+// 	r.Users = uniqueNonZero(tmp.Users)
+// 	r.Chats = uniqueNonZero(tmp.Chats)
+// 	r.Channels = uniqueNonZero(tmp.Channels)
+// 	return nil
+// }
 
-// uniqueNonZero удаляет нули и дубликаты из списка ID, сохраняя порядок
-// первого появления. Возвращает nil, если в результате список пуст.
-//
-// Причина: нулевые/повторные ID часто возникают при ручном редактировании
-// конфигов и приводят к «мусору» при маршрутизации уведомлений.
-func uniqueNonZero(in []int64) []int64 {
-	if len(in) == 0 {
-		return nil
-	}
-	seen := make(map[int64]struct{}, len(in))
-	out := make([]int64, 0, len(in))
-	for _, v := range in {
-		if v == 0 {
-			continue
-		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
+// // uniqueNonZero удаляет нули и дубликаты из списка ID, сохраняя порядок
+// // первого появления. Возвращает nil, если в результате список пуст.
+// //
+// // Причина: нулевые/повторные ID часто возникают при ручном редактировании
+// // конфигов и приводят к «мусору» при маршрутизации уведомлений.
+// func uniqueNonZero(in []int64) []int64 {
+// 	if len(in) == 0 {
+// 		return nil
+// 	}
+// 	seen := make(map[int64]struct{}, len(in))
+// 	out := make([]int64, 0, len(in))
+// 	for _, v := range in {
+// 		if v == 0 {
+// 			continue
+// 		}
+// 		if _, ok := seen[v]; ok {
+// 			continue
+// 		}
+// 		seen[v] = struct{}{}
+// 		out = append(out, v)
+// 	}
+// 	if len(out) == 0 {
+// 		return nil
+// 	}
+// 	return out
+// }
 
-// NotifyConfig задает способ доставки уведомления при срабатывании фильтра:
-//   - Recipients: список адресатов (пользователи, чаты, каналы),
-//   - Forward: пересылать ли оригинал сообщения вместо отправки текста,
-//   - Template: форматируемая строка для текстового уведомления.
-//
-// Конкретная реализация уведомителя (client/bot) определяется через EnvConfig.
-type NotifyConfig struct {
-	Recipients RecipientTargets `json:"recipients"`
-	Forward    bool             `json:"forward"`
-	Template   string           `json:"template"`
-}
+// // NotifyConfig задает способ доставки уведомления при срабатывании фильтра:
+// //   - Recipients: список адресатов (пользователи, чаты, каналы),
+// //   - Forward: пересылать ли оригинал сообщения вместо отправки текста,
+// //   - Template: форматируемая строка для текстового уведомления.
+// //
+// // Конкретная реализация уведомителя (client/bot) определяется через EnvConfig.
+// type NotifyConfig struct {
+// 	Recipients RecipientTargets `json:"recipients"`
+// 	Forward    bool             `json:"forward"`
+// 	Template   string           `json:"template"`
+// }
 
-// Filter описывает законченное правило обработки:
-//   - ID: стабильный идентификатор правила (для логов, отладки, трекинга),
-//   - Chats: из каких источников брать сообщения,
-//   - Match: критерии совпадения,
-//   - Urgent: маркер «срочных» уведомлений (может влиять на канал доставки),
-//   - Notify: параметры маршрутизации уведомлений.
-//
-// NB: «срочность» никак не интерпретируется здесь в конфиге; семантика — на стороне
-// потребителей (например, выбор немедленной отправки вместо расписания).
-type Filter struct {
-	ID     string       `json:"id"`
-	Chats  []int64      `json:"chats"`
-	Match  Match        `json:"match"`
-	Urgent bool         `json:"urgent"`
-	Notify NotifyConfig `json:"notify"`
-}
+// // Filter описывает законченное правило обработки:
+// //   - ID: стабильный идентификатор правила (для логов, отладки, трекинга),
+// //   - Chats: из каких источников брать сообщения,
+// //   - Match: критерии совпадения,
+// //   - Urgent: маркер «срочных» уведомлений (может влиять на канал доставки),
+// //   - Notify: параметры маршрутизации уведомлений.
+// //
+// // NB: «срочность» никак не интерпретируется здесь в конфиге; семантика — на стороне
+// // потребителей (например, выбор немедленной отправки вместо расписания).
+// type Filter struct {
+// 	ID     string       `json:"id"`
+// 	Chats  []int64      `json:"chats"`
+// 	Match  Match        `json:"match"`
+// 	Urgent bool         `json:"urgent"`
+// 	Notify NotifyConfig `json:"notify"`
+// }
 
-// FiltersConfig — обертка для корневого JSON: { "filters": [...] }.
-// Удобно иметь явную структуру ради расширений и валидации верхнего уровня.
-type FiltersConfig struct {
-	Filters []Filter `json:"filters"`
-}
+// // FiltersConfig — обертка для корневого JSON: { "filters": [...] }.
+// // Удобно иметь явную структуру ради расширений и валидации верхнего уровня.
+// type FiltersConfig struct {
+// 	Filters []Filter `json:"filters"`
+// }
 
 // Config агрегирует конфигурацию среды и набор фильтров. Здесь хранится также
 // кеш «уникальных чатов», чтобы быстро решать, можно ли обрабатывать диалог,
@@ -182,12 +181,12 @@ type FiltersConfig struct {
 // Потокобезопасность: публичные геттеры берут RLock. Перезагрузка фильтров
 // (loadFilters) держит эксклюзивный Lock на время обновления полей.
 type Config struct {
-	Env         EnvConfig
-	filters     []Filter     // десериализованный набор фильтров из JSON
-	uniqueChats []int64      // кэш уникальных чатов, упрощающий проверки доступа
-	filtersPath string       // путь к файлу filters.json для повторной загрузки
-	warnings    []string     // предупреждения, накопленные при чтении окружения
-	mu          sync.RWMutex // защита конкурентного доступа к конфигурации
+	Env EnvConfig
+	// filters     []Filter     // десериализованный набор фильтров из JSON
+	// uniqueChats []int64      // кэш уникальных чатов, упрощающий проверки доступа
+	// filtersPath string       // путь к файлу filters.json для повторной загрузки
+	warnings []string     // предупреждения, накопленные при чтении окружения
+	mu       sync.RWMutex // защита конкурентного доступа к конфигурации
 }
 
 // Значения по умолчанию для параметров окружения и связанных файлов.
@@ -205,6 +204,7 @@ const (
 	defaultNotifyTimezone    = "Europe/Moscow"
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
+	defaultFiltersFile       = "assets/filters.json"
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
@@ -223,7 +223,7 @@ var (
 //
 // Повторный вызов запрещен (возвращается ошибка), чтобы избежать гонок
 // конфигурации на старте.
-func Load(envPath, filtersPath string) error {
+func Load(envPath string) error {
 	if cfgDone {
 		return errors.New("config already loaded")
 	}
@@ -232,7 +232,7 @@ func Load(envPath, filtersPath string) error {
 	}
 	cfgInstance.mu.Lock()
 	defer cfgInstance.mu.Unlock()
-	newCfg, err := loadConfig(envPath, filtersPath)
+	newCfg, err := loadConfig(envPath)
 	cfgInstance = newCfg
 	cfgDone = true
 	return err
@@ -240,7 +240,7 @@ func Load(envPath, filtersPath string) error {
 
 // loadConfig выполняет фактическую загрузку/валидацию без установки глобального
 // состояния. Удобно для тестов: можно собрать временный Config и проверить его.
-func loadConfig(envPath, filtersPath string) (*Config, error) {
+func loadConfig(envPath string) (*Config, error) {
 	if err := godotenv.Load(envPath); err != nil {
 		return nil, fmt.Errorf("failed to load .env: %w", err)
 	}
@@ -281,6 +281,7 @@ func loadConfig(envPath, filtersPath string) (*Config, error) {
 	notifiedCacheFile := sanitizeFile("NOTIFIED_CACHE_FILE", os.Getenv("NOTIFIED_CACHE_FILE"),
 		defaultNotifiedCacheFile, &warnings)
 	notifiedTTLDays := parseIntDefault("NOTIFIED_CACHE_TTL_DAYS", defaultNotifiedTTLDays, greaterThanZero, &warnings)
+	filtersFile := sanitizeFile("FILTERS_FILE", os.Getenv("FILTERS_FILE"), defaultFiltersFile, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,
@@ -302,91 +303,92 @@ func loadConfig(envPath, filtersPath string) (*Config, error) {
 		NotifySchedule:    notifySchedule,
 		NotifiedCacheFile: notifiedCacheFile,
 		NotifiedTTLDays:   notifiedTTLDays,
+		FiltersFile:       filtersFile,
 	}
 
 	cfg := &Config{
-		Env:         env,
-		filtersPath: filtersPath,
-		warnings:    warnings,
+		Env: env,
+		// filtersPath: filtersPath,
+		warnings: warnings,
 	}
 
-	if cfgErr := cfg.loadFilters(); cfgErr != nil {
-		return nil, cfgErr
-	}
+	// if cfgErr := cfg.loadFilters(); cfgErr != nil {
+	// 	return nil, cfgErr
+	// }
 
 	return cfg, nil
 }
 
-// loadFilters перечитывает filters.json, десериализует и пересобирает кэш
-// уникальных чатов. Метод держит эксклюзивный Lock на период обновления, чтобы
-// читатели всегда видели целостное состояние.
-func (c *Config) loadFilters() error {
-	data, readErr := os.ReadFile(filepath.Clean(c.filtersPath))
-	if readErr != nil {
-		return fmt.Errorf("failed to read filters json: %w", readErr)
-	}
+// // loadFilters перечитывает filters.json, десериализует и пересобирает кэш
+// // уникальных чатов. Метод держит эксклюзивный Lock на период обновления, чтобы
+// // читатели всегда видели целостное состояние.
+// func (c *Config) loadFilters() error {
+// 	data, readErr := os.ReadFile(filepath.Clean(c.filtersPath))
+// 	if readErr != nil {
+// 		return fmt.Errorf("failed to read filters json: %w", readErr)
+// 	}
 
-	var filters FiltersConfig
-	if err := json.Unmarshal(data, &filters); err != nil {
-		return fmt.Errorf("failed to unmarshal filters json: %w", err)
-	}
+// 	var filters FiltersConfig
+// 	if err := json.Unmarshal(data, &filters); err != nil {
+// 		return fmt.Errorf("failed to unmarshal filters json: %w", err)
+// 	}
 
-	// Собираем уникальные чаты для быстрой проверки доступа/привязки диалогов
-	unique := make(map[int64]struct{})
-	for _, f := range filters.Filters {
-		for _, chat := range f.Chats {
-			unique[chat] = struct{}{}
-		}
-	}
-	var chats []int64
-	for chat := range unique {
-		chats = append(chats, chat)
-	}
+// 	// Собираем уникальные чаты для быстрой проверки доступа/привязки диалогов
+// 	unique := make(map[int64]struct{})
+// 	for _, f := range filters.Filters {
+// 		for _, chat := range f.Chats {
+// 			unique[chat] = struct{}{}
+// 		}
+// 	}
+// 	var chats []int64
+// 	for chat := range unique {
+// 		chats = append(chats, chat)
+// 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.filters = filters.Filters
-	c.uniqueChats = chats
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	c.filters = filters.Filters
+// 	c.uniqueChats = chats
 
-	return nil
-}
+// 	return nil
+// }
 
-// LoadFilters — внешняя обертка для горячего перечитывания filters.json.
-// Ожидается вызывать из админ-команд или сторожей, когда конфиг фильтров
-// меняется на диске. Гарантирует потокобезопасное обновление.
-func LoadFilters() error {
-	return cfgInstance.loadFilters()
-}
+// // LoadFilters — внешняя обертка для горячего перечитывания filters.json.
+// // Ожидается вызывать из админ-команд или сторожей, когда конфиг фильтров
+// // меняется на диске. Гарантирует потокобезопасное обновление.
+// func LoadFilters() error {
+// 	return cfgInstance.loadFilters()
+// }
 
-// GetFilters возвращает актуальную копию среза фильтров. Благодаря RLock
-// и копированию наружу, вызывающий код не может повредить внутреннее состояние.
-func (c *Config) GetFilters() []Filter {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.filters
-}
+// // GetFilters возвращает актуальную копию среза фильтров. Благодаря RLock
+// // и копированию наружу, вызывающий код не может повредить внутреннее состояние.
+// func (c *Config) GetFilters() []Filter {
+// 	c.mu.RLock()
+// 	defer c.mu.RUnlock()
+// 	return c.filters
+// }
 
-// Filters — пакетный геттер для глобального singleton. Удобен в местах,
-// где не держат ссылку на Config, но нужно быстро получить правила.
-func Filters() []Filter {
-	return cfgInstance.GetFilters()
-}
+// // Filters — пакетный геттер для глобального singleton. Удобен в местах,
+// // где не держат ссылку на Config, но нужно быстро получить правила.
+// func Filters() []Filter {
+// 	return cfgInstance.GetFilters()
+// }
 
-// GetUniqueChats возвращает копию множества всех чатов, встречающихся во всех
-// фильтрах. Отдаётся новый срез, чтобы внешний код не мог модифицировать кеш.
-func (c *Config) GetUniqueChats() []int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	// копия, чтобы не отдавать внутренний срез наружу
-	result := make([]int64, len(c.uniqueChats))
-	copy(result, c.uniqueChats)
-	return result
-}
+// // GetUniqueChats возвращает копию множества всех чатов, встречающихся во всех
+// // фильтрах. Отдаётся новый срез, чтобы внешний код не мог модифицировать кеш.
+// func (c *Config) GetUniqueChats() []int64 {
+// 	c.mu.RLock()
+// 	defer c.mu.RUnlock()
+// 	// копия, чтобы не отдавать внутренний срез наружу
+// 	result := make([]int64, len(c.uniqueChats))
+// 	copy(result, c.uniqueChats)
+// 	return result
+// }
 
-// UniqueChats — пакетный геттер для списка уникальных чатов из singleton.
-func UniqueChats() []int64 {
-	return cfgInstance.GetUniqueChats()
-}
+// // UniqueChats — пакетный геттер для списка уникальных чатов из singleton.
+// func UniqueChats() []int64 {
+// 	return cfgInstance.GetUniqueChats()
+// }
 
 // Warnings возвращает накопленные предупреждения, возникшие при загрузке .env
 // (например, когда подставлено значение по умолчанию). Возвращается копия.
