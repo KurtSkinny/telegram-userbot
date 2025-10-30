@@ -21,9 +21,9 @@ import (
 type Match struct {
 	KeywordsAny        []string `json:"keywords_any"`
 	KeywordsAll        []string `json:"keywords_all"`
-	Regex              string   `json:"regex"`
+	Regex              []string `json:"regex"`
 	ExcludeKeywordsAny []string `json:"exclude_any"`
-	ExcludeRegex       string   `json:"exclude_regex"`
+	ExcludeRegex       []string `json:"exclude_regex"`
 }
 
 // NotifyConfig задает способ доставки уведомления при срабатывании фильтра:

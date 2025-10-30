@@ -6,9 +6,9 @@
       "match": {
         "keywords_any": ["any","keyword"],
         "keywords_all": ["all", "keywords", "at", "once"],
-        "regex": "(?i)some\\s?regex",
+        "regex": ["(?i)some\\s?regex", "(?i)another\\sregex"],
         "exclude_any": ["white", "black"],
-        "exclude_regex": "\\s(papper|coffie)\\s"
+        "exclude_regex": ["\\s(papper|coffie)\\s"]
       },
       "urgent": true,
       "notify": {

@@ -6,22 +6,22 @@
 //   на выходе — детализированное объяснение, какой фильтр сработал и почему.
 //
 // Модель данных и инварианты:
-//   - Сопоставление нечувствительно к регистру.
+//   - Сопоставление нечувствительно к регистру (кроме regex).
 //   - Для "словесных" ключей учитываются границы слов.
 //   - Порядок правил в конфигурации важен: результаты возвращаются в том же порядке.
 //   - Фильтр учитывается только для тех получателей, которые перечислены в Filter.Chats.
 //
 // Конвейер проверки одного фильтра (логическое И между include‑условиями и логическое НЕ для exclude):
-//   1) includeRegex        — положительный regexp. Пустой шаблон считается успешно пройденным;
+//   1) includeRegex        — массив положительных regexp (логика ИЛИ). Пустой шаблон считается успешно пройденным;
 //      используется re.FindString, то есть ищется непустая подстрока, а не полное совпадение.
 //   2) includeKeywordsAll  — все слова из списка обязаны встретиться;
 //   3) includeKeywordsAny  — достаточно хотя бы одного слова;
 //   4) excludeByKeywords   — если встретилось любое "запрещённое" слово, фильтр отклоняется;
-//   5) excludeByRegex      — если запретительный regexp совпал, фильтр отклоняется.
+//   5) excludeByRegex      — массив запретительных regexp совпал (логика ИЛИ), фильтр отклоняется.
 //
 // Особенности и ограничения:
 //   - Границы слов реализованы через Unicode-классы в регэкспе: (^|[^\p{L}\p{N}]) ... ([^\p{L}\p{N}]|$).
-//     Это снимает проблему с многобайтными рунaми UTF-8 и даёт корректные границы для кириллицы и др.
+//     Это снимает проблему с (многобайтными) рунaми UTF-8 и даёт корректные границы для кириллицы и др.
 //   - Ошибки компиляции регулярных выражений приводят к отклонению фильтра с логированием.
 //   - Время работы линейное относительно длины текста и числа ключей,
 //     если не учитывать сложность регулярных выражений.
@@ -31,6 +31,7 @@ package filters
 import (
 	"regexp"
 	"slices"
+	"strings"
 
 	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/logger"
@@ -70,6 +71,9 @@ func (fe *FilterEngine) ProcessMessage(
 	entities tg.Entities,
 	msg *tg.Message,
 ) []FilterMatchResult {
+	if msg == nil {
+		return nil
+	}
 	peerKey := tgutil.GetPeerID(msg.PeerID)
 
 	var results []FilterMatchResult
@@ -133,35 +137,59 @@ func MatchMessage(text string, f Filter) Result {
 	if ok, err := excludeByRegex(text, f.Match.ExcludeRegex); ok {
 		return Result{}
 	} else if err != nil {
-		// NOTE: вероятная опечатка в сообщении: должно быть excludeByRegex
-		logger.Errorf("error in MatchMessage, includeRegex: %v", err)
+		logger.Errorf("error in MatchMessage, excludeByRegex: %v", err)
 		return Result{}
 	}
 
+	result.Keywords = dedupPreserveOrderCI(result.Keywords)
 	result.Matched = true
 	return result
+}
+
+// dedupPreserveOrderCI удаляет дубликаты из списка строк без учёта регистра,
+func dedupPreserveOrderCI(ss []string) []string {
+	if len(ss) > 1 {
+		seen := make(map[string]struct{}, len(ss))
+		out := ss[:0]
+		for _, s := range ss {
+			k := strings.ToLower(s)
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, s)
+		}
+		return out
+	} else {
+		return ss
+	}
 }
 
 // includeRegex компилирует и применяет положительный regexp.
 // Пустой pattern трактуется как "совпадает всегда".
 // Возвращает найденный фрагмент, флаг ok и ошибку компиляции/применения.
 // NB: используется re.FindString, поэтому совпадение ищется как подстрока.
-func includeRegex(text, pattern string) (string, bool, error) {
-	if pattern == "" {
+func includeRegex(text string, pattern []string) (string, bool, error) {
+	if len(pattern) == 0 {
 		return "", true, nil
 	}
 
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", false, err
+	for _, p := range pattern {
+		if p == "" {
+			return "", true, nil
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return "", false, err
+		}
+
+		match := re.FindString(text)
+		if match != "" {
+			return match, true, nil
+		}
 	}
 
-	match := re.FindString(text)
-	if match == "" {
-		return "", false, nil
-	}
-
-	return match, true, nil
+	return "", false, nil
 }
 
 // includeKeywordsAll — все ключевые слова должны присутствовать в тексте (без учёта регистра).
@@ -225,17 +253,18 @@ func excludeByKeywords(text string, keywords []string) bool {
 // excludeByRegex — запретительный regexp.
 // Пустой шаблон означает "ничего не запрещено".
 // При ошибке компиляции возвращается ошибка, чтобы вызывающий мог залогировать и отклонить фильтр.
-func excludeByRegex(text, pattern string) (bool, error) {
-	if pattern == "" {
+func excludeByRegex(text string, pattern []string) (bool, error) {
+	if len(pattern) == 0 {
 		return false, nil
 	}
 
-	re, err := regexp.Compile(pattern)
-	if err != nil {
+	if matched, ok, err := includeRegex(text, pattern); ok && matched != "" {
+		return true, nil
+	} else if err != nil {
 		return false, err
 	}
 
-	return re.MatchString(text), nil
+	return false, nil
 }
 
 // ContainsSmart — проверка наличия ключа в тексте с учётом границ слов и регистра.
