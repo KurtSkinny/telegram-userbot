@@ -132,6 +132,10 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 		}
 	}
 
+	if err := r.peers.LoadFromStorage(ctx); err != nil {
+		logger.Errorf("failed to load peers from storage: %v", err)
+	}
+
 	if err := r.peers.WarmupIfEmpty(ctx, r.cl.API); err != nil {
 		logger.Errorf("failed to warm up peers manager: %v", err)
 		if config.Env().Notifier == notifierClient {
