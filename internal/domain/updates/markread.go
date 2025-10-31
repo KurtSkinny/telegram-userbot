@@ -11,13 +11,13 @@ package updates
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"time"
 
 	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
 	tgruntime "telegram-userbot/internal/infra/telegram/runtime"
 	"telegram-userbot/internal/infra/telegram/status"
@@ -80,7 +80,7 @@ func (h *Handlers) runMarkReadScheduler(ctx context.Context) {
 // Ошибки разрешения пиров логируются и не блокируют обработку остальных.
 func (h *Handlers) flushUnread(ctx context.Context) {
 	h.unreadMu.Lock()
-	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для cache.GetInputPeerRaw.
+	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для разрешения через peers менеджер.
 	entities := tg.Entities{}
 	messages := []*tg.Message{}
 
@@ -107,8 +107,11 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 
 		for _, candidate := range candidates {
 			msg.PeerID = candidate
-			// Best‑effort разрешение через локальный кэш: на успех достаточно любой подходящей формы peer.
-			if _, err := cache.GetInputPeerRaw(entities, msg); err == nil {
+			if h.peers == nil {
+				lastErr = errors.New("peers manager is not available")
+				continue
+			}
+			if _, err := h.peers.InputPeerFromMessage(ctx, msg); err == nil {
 				resolved = true
 				break
 			} else {
@@ -156,9 +159,13 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 // Перед каждым вызовом дожидается онлайна, ошибки пробрасывает в connection.HandleError
 // и при успехе синхронизирует локальный кэш lastUnreadCache, чтобы не повторять работу.
 func (h *Handlers) markRead(ctx context.Context, entities tg.Entities, msg *tg.Message) {
-	peer, pErr := cache.GetInputPeerRaw(entities, msg)
+	if h.peers == nil {
+		logger.Error("markRead: peers manager is not available")
+		return
+	}
+	peer, pErr := h.peers.InputPeerFromMessage(ctx, msg)
 	if pErr != nil {
-		logger.Errorf("markRead: get input peer failed: %v", pErr.Error())
+		logger.Errorf("markRead: get input peer failed: %v", pErr)
 		return
 	}
 

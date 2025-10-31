@@ -21,8 +21,8 @@ import (
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/lifecycle"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 
 	"telegram-userbot/internal/infra/telegram/status"
 
@@ -45,6 +45,7 @@ type Runner struct {
 	h       *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
 	ctx     context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
 	stop    context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
+	peers   *peersmgr.Service         // Сервис пиров (peers.Manager + persist storage).
 }
 
 // NewRunner подготавливает Runner с переданными зависимостями: ядро клиента, очередь уведомлений,
@@ -58,6 +59,7 @@ func NewRunner(
 	dedup *concurrency.Deduplicator,
 	debouncer *concurrency.Debouncer,
 	handlers *domainupdates.Handlers,
+	peers *peersmgr.Service,
 ) *Runner {
 	return &Runner{
 		ctx:     ctx,
@@ -68,6 +70,7 @@ func NewRunner(
 		dedup:   dedup,
 		deb:     debouncer,
 		h:       handlers,
+		peers:   peers,
 	}
 }
 
@@ -105,17 +108,22 @@ func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 			zap.Int64("ID", self.ID),
 		)
 
-		// todo: заменить на готовый peerscache manager из contrib
-		// Прогреваем кэш пиров заранее: обработчики обновлений смогут быстрее резолвить участников/диалоги.
-		if cacheErr := cache.BuildPeerCache(); cacheErr != nil {
-			logger.Errorf("failed to build peer cache: %v", cacheErr)
-			if config.Env().Notifier != "bot" {
-				logger.Error("peer cache error, cant use client notifier")
-				return cacheErr
+		if r.peers != nil {
+			if initErr := r.peers.Mgr.Init(ctx); initErr != nil {
+				logger.Errorf("failed to init peers manager: %v", initErr)
+				if config.Env().Notifier != "bot" {
+					return initErr
+				}
 			}
+			if warmErr := r.peers.WarmupIfEmpty(ctx, r.cl.API); warmErr != nil {
+				logger.Errorf("failed to warm up peers manager: %v", warmErr)
+				if config.Env().Notifier != "bot" {
+					logger.Error("peers warmup error, cant use client notifier")
+					return warmErr
+				}
+			}
+			logger.Debug("Peers warmup complete")
 		}
-
-		logger.Debug("BuildPeerCache: ok")
 
 		// lifecycle.Manager управляет узлами с зависимостями: Register → StartAll → Shutdown.
 		// Здесь контекстом для узлов служит контекст MTProto‑движка, чтобы узлы завершались раньше engine.
@@ -202,6 +210,22 @@ func (r *Runner) registerClientNodes(
 	updmgr *tgupdates.Manager,
 	selfID int64,
 ) error {
+	if r.peers != nil {
+		if err := lc.Register(
+			"peers_manager",
+			"",
+			nil,
+			func(nodeCtx context.Context) (context.Context, error) {
+				return nodeCtx, nil
+			},
+			func(context.Context) error {
+				return r.peers.Close()
+			},
+		); err != nil {
+			return err
+		}
+	}
+
 	// Узел: connection_manager
 	// Инициализирует и публикует текущее соединение/контекст клиента для других подсистем.
 	// Без зависимостей, так как сам предоставляет базовую инфраструктуру.
@@ -363,7 +387,7 @@ func (r *Runner) registerClientNodes(
 
 	// Узел: cli
 	// Сервис интерактивных команд. Не блокирует основную петлю, но может инициировать shutdown через r.stop().
-	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif)
+	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif, r.peers)
 	if err := lc.Register(
 		"cli",
 		"",

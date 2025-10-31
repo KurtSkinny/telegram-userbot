@@ -7,6 +7,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,11 +19,12 @@ import (
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/infra/telegram/status"
 	versioninfo "telegram-userbot/internal/support/version"
 
+	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 )
 
@@ -37,7 +39,8 @@ type commandDescriptor struct {
 var (
 	commandDescriptors = []commandDescriptor{
 		{name: "help", description: "Show available commands with short descriptions"},
-		{name: "list", description: "Print cached dialogs"},
+		{name: "list", description: "Print cached dialogs (offline snapshot)"},
+		{name: "refresh dialogs", description: "Fetch dialogs from API and update cache"},
 		{name: "reload", description: "Reload filters.json and refresh filters"},
 		{name: "status", description: "Show queue status (sizes, last drain, next schedule"},
 		{name: "flush", description: "Drain regular queue immediately"},
@@ -57,11 +60,14 @@ type Service struct {
 	stopApp   context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
 	filters   *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue  // очередь уведомлений; нужна для flush/status
+	peers     *peersmgr.Service     // peers-кэш, предоставляет офлайн-данные по диалогам
 	cancel    context.CancelFunc    // локальная отмена run-цикла CLI
 	wg        sync.WaitGroup        // ожидание завершения фоновой горутины run
 	onceStart sync.Once             // идемпотентный запуск
 	onceStop  sync.Once             // идемпотентная остановка
 }
+
+const refreshDialogsTimeout = 30 * time.Second
 
 // NewService создаёт CLI-сервис. Параметр stopApp используется как «глобальная»
 // остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
@@ -71,8 +77,9 @@ func NewService(
 	stopApp context.CancelFunc,
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
+	peers *peersmgr.Service,
 ) *Service {
-	return &Service{cl: cl, stopApp: stopApp, filters: filterEngine, notif: notif}
+	return &Service{cl: cl, stopApp: stopApp, filters: filterEngine, notif: notif, peers: peers}
 }
 
 // Start запускает основной цикл CLI в отдельной горутине. Повторные вызовы
@@ -201,7 +208,9 @@ func (s *Service) handleCommand(cmd string) bool {
 		printCommandHelp()
 	case "list":
 		pr.Println("Fetching dialogs...")
-		listDialogs()
+		s.listDialogs()
+	case "refresh dialogs":
+		s.handleRefreshDialogs()
 	case "reload":
 		if err := s.filters.GetFilters(); err != nil {
 			pr.ErrPrintln("reload error:", err)
@@ -241,6 +250,20 @@ func (s *Service) handleCommand(cmd string) bool {
 	return false
 }
 
+func (s *Service) handleRefreshDialogs() {
+	if s.peers == nil {
+		pr.ErrPrintln("peers manager is not available")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), refreshDialogsTimeout)
+	defer cancel()
+	if err := s.peers.RefreshDialogs(ctx, s.cl.API); err != nil {
+		pr.ErrPrintln("refresh dialogs error:", err)
+		return
+	}
+	pr.Println("Dialogs cache refreshed.")
+}
+
 // handleTest отправляет тестовое сообщение админу, чтобы проверить связность.
 // Логика:
 //  1. переводим статус в online (status.GoOnline),
@@ -256,7 +279,6 @@ func (s *Service) handleTest() {
 	// defer cancel()
 
 	// adminID := int64(config.Env().AdminUID)
-	// peer, err := cache.GetInputPeerUser(adminID)
 	// if err != nil {
 	// 	logger.Errorf("CLI test command: resolve admin peer failed: %v", err)
 	// }
@@ -278,7 +300,16 @@ func (s *Service) handleTest() {
 	message := fmt.Sprintf("Test message from CLI at %s", currentTime)
 	logger.Infof("CLI test command: preparing message for admin %d", adminID)
 
-	peer, err := cache.GetInputPeerUser(adminID)
+	var (
+		peer tg.InputPeerClass
+		err  error
+	)
+	resolveCtx := context.Background()
+	if s.peers == nil {
+		err = errors.New("peers manager is not available")
+	} else {
+		peer, err = s.peers.InputPeerByKind(resolveCtx, notifications.RecipientTypeUser, adminID)
+	}
 	if err != nil {
 		logger.Errorf("CLI test command: resolve admin peer failed: %v", err)
 	}
@@ -340,68 +371,114 @@ func (s *Service) handleStatus() {
 	pr.Printf("Next schedule tick: %s\n", st.NextScheduleAt.In(st.Location).Format(time.RFC3339))
 }
 
-// listDialogs выводит кэшированные диалоги (из cache.Dialogs) в человекочитаемом виде.
-// Функция не выполняет сетевых запросов и работает только по локальному кэшу.
-func listDialogs() {
-	dialogs := cache.Dialogs()
+// listDialogs выводит офлайн-снимок диалогов без сетевых запросов.
+func (s *Service) listDialogs() {
+	if s.peers == nil {
+		pr.ErrPrintln("peers manager is not available")
+		return
+	}
+
+	dialogs := s.peers.Dialogs()
 	if len(dialogs) == 0 {
 		pr.Println("No dialogs cached yet.")
 		return
 	}
-	for _, d := range dialogs {
-		printDialogCached(d)
+
+	ctx := context.Background()
+	for _, item := range dialogs {
+		s.printDialog(ctx, item)
 	}
 	pr.Printf("Total dialogs: %d\n", len(dialogs))
 }
 
-// printDialogCached печатает одну запись диалога по данным из кэша, корректно обрабатывая
-// пользователей, чаты, каналы и папки. Для неизвестных типов выводит отладочную дампу.
-func printDialogCached(d tg.DialogClass) {
-	switch dlg := d.(type) {
-	case *tg.Dialog:
-		switch peer := dlg.Peer.(type) {
-		case *tg.PeerUser:
-			first, _ := cache.UserFirstName(peer.UserID)
-			last, _ := cache.UserLastName(peer.UserID)
-			username, _ := cache.UserUsername(peer.UserID)
-			fullname := strings.TrimSpace(first + " " + last)
-			if fullname == "" {
-				fullname = "<unknown>"
+func (s *Service) printDialog(ctx context.Context, ref peersmgr.DialogRef) {
+	var (
+		rawUser    *tg.User
+		rawChat    *tg.Chat
+		rawChannel *tg.Channel
+	)
+
+	if s.peers != nil {
+		if resolved, ok, err := s.peers.ResolvePeer(ctx, ref.Kind, ref.ID); err != nil {
+			logger.Debugf("CLI list: resolve %s:%d failed: %v", ref.Kind, ref.ID, err)
+		} else if ok {
+			switch v := resolved.(type) {
+			case peers.User:
+				rawUser = v.Raw()
+			case peers.Chat:
+				rawChat = v.Raw()
+			case peers.Channel:
+				rawChannel = v.Raw()
 			}
-			pr.Printf("User: '%s' (@%s) id: %d\n", fullname, username, peer.UserID)
-		case *tg.PeerChat:
-			title, _ := cache.ChatTitle(peer.ChatID)
-			if title == "" {
-				title = "<unknown chat>"
-			}
-			pr.Printf("Chat: '%s' id: %d\n", title, peer.ChatID)
-		case *tg.PeerChannel:
-			title, _ := cache.ChannelTitle(peer.ChannelID)
-			username, _ := cache.ChannelUsername(peer.ChannelID)
-			broadcast, megagroup, _ := cache.ChannelFlags(peer.ChannelID)
-			label := "Channel-like"
-			if broadcast {
-				label = "Channel"
-			} else if megagroup {
-				label = "Supergroup"
-			}
-			if title == "" {
-				title = "<untitled channel>"
-			}
-			pr.Printf("%s: '%s' (@%s) id: %d\n", label, title, username, peer.ChannelID)
-		default:
-			pr.Printf("Unknown peer: %+v\n", peer)
 		}
-	case *tg.DialogFolder:
-		folder := dlg.Folder
-		title := strings.TrimSpace(folder.Title)
-		if title == "" {
-			title = "<unnamed folder>"
-		}
-		pr.Printf("Folder: '%s' id: %d\n", title, folder.ID)
-	default:
-		pr.Printf("Unknown dialog: %+v\n", dlg)
 	}
+
+	switch ref.Kind {
+	case peersmgr.DialogKindUser:
+		s.printUser(ref.ID, rawUser)
+	case peersmgr.DialogKindChat:
+		s.printChat(ref.ID, rawChat)
+	case peersmgr.DialogKindChannel:
+		s.printChannel(ref.ID, rawChannel)
+	case peersmgr.DialogKindFolder:
+		pr.Printf("Folder: id: %d\n", ref.ID)
+	default:
+		pr.Printf("Unknown dialog kind %q id: %d\n", ref.Kind, ref.ID)
+	}
+}
+
+func (s *Service) printUser(id int64, raw *tg.User) {
+	if raw == nil {
+		pr.Printf("User: id: %d (no cached metadata)\n", id)
+		return
+	}
+	first := strings.TrimSpace(raw.FirstName)
+	last := strings.TrimSpace(raw.LastName)
+	fullName := strings.TrimSpace(strings.Join([]string{first, last}, " "))
+	if fullName == "" {
+		fullName = "<unknown>"
+	}
+	username := strings.TrimPrefix(raw.Username, "@")
+	if username == "" {
+		username = "-"
+	}
+	pr.Printf("User: '%s' (@%s) id: %d\n", fullName, username, id)
+}
+
+func (s *Service) printChat(id int64, raw *tg.Chat) {
+	if raw == nil {
+		pr.Printf("Chat: id: %d (no cached metadata)\n", id)
+		return
+	}
+	title := strings.TrimSpace(raw.Title)
+	if title == "" {
+		title = "<unknown chat>"
+	}
+	pr.Printf("Chat: '%s' id: %d\n", title, id)
+}
+
+func (s *Service) printChannel(id int64, raw *tg.Channel) {
+	if raw == nil {
+		pr.Printf("Channel: id: %d (no cached metadata)\n", id)
+		return
+	}
+
+	title := strings.TrimSpace(raw.Title)
+	if title == "" {
+		title = "<untitled channel>"
+	}
+	username := strings.TrimPrefix(raw.Username, "@")
+	if username == "" {
+		username = "-"
+	}
+
+	label := "Channel-like"
+	if raw.Broadcast {
+		label = "Channel"
+	} else if raw.Megagroup {
+		label = "Supergroup"
+	}
+	pr.Printf("%s: '%s' (@%s) id: %d\n", label, title, username, id)
 }
 
 // whoAmI возвращает строку с краткой информацией о текущем аккаунте (имя, username, id).

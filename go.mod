@@ -4,9 +4,11 @@ go 1.25.0
 
 require (
 	github.com/chzyer/readline v1.5.1
+	github.com/gotd/contrib v0.13.0
 	github.com/gotd/td v0.132.0
 	github.com/joho/godotenv v1.5.1
 	github.com/kr/pretty v0.3.1
+	go.etcd.io/bbolt v1.3.6
 	go.uber.org/zap v1.27.0
 	golang.org/x/term v0.36.0
 )

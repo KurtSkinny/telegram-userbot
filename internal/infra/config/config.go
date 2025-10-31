@@ -82,7 +82,7 @@ const (
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
-	defaultPeersCacheFile    = "data/peerscache.db"
+	defaultPeersCacheFile    = "data/peers_cache.bbolt"
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
@@ -159,7 +159,7 @@ func loadConfig(envPath string) (*Config, error) {
 		defaultNotifiedCacheFile, &warnings)
 	notifiedTTLDays := parseIntDefault("NOTIFIED_CACHE_TTL_DAYS", defaultNotifiedTTLDays, greaterThanZero, &warnings)
 	filtersFile := sanitizeFile("FILTERS_FILE", os.Getenv("FILTERS_FILE"), defaultFiltersFile, &warnings)
-	peersCacheFile := sanitizeFile("PEERSCHACHE_FILE", os.Getenv("PEERSCHACHE_FILE"), defaultPeersCacheFile, &warnings)
+	peersCacheFile := sanitizeFile("PEERS_CACHE_FILE", os.Getenv("PEERS_CACHE_FILE"), defaultPeersCacheFile, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,

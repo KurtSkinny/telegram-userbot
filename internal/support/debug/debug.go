@@ -9,13 +9,15 @@
 package debug
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
-	"telegram-userbot/internal/infra/telegram/cache"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"unicode/utf8"
 
+	tdpeers "github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 )
@@ -29,10 +31,10 @@ var DEBUG = true
 // Формат: [prefix] <источник> > <читаемое имя>: <обрезанный текст>.
 // Особенности:
 //   - текст режется до безопасной длины по рунам, чтобы не ломать UTF‑8;
-//   - для пользователей/чатов/каналов имена берутся из cache.*;
+//   - для пользователей/чатов/каналов имена берутся из peersmgr.Service;
 //   - entities передаются для потенциальных улучшений (сейчас не используются);
 //   - отсутствующие метаданные заменяются плейсхолдерами ("<unknown>").
-func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities) {
+func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities, mgr *peersmgr.Service) {
 	if !DEBUG {
 		// Отладка выключена — ничего не делаем. Этот ранний выход упраздняет лишнюю работу.
 		return
@@ -54,28 +56,57 @@ func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities) {
 	// Определяем тип собеседника/чата и вытягиваем читабельные имена из кэша.
 	switch peer := msg.PeerID.(type) {
 	case *tg.PeerUser:
-		first, _ := cache.UserFirstName(peer.UserID)
-		last, _ := cache.UserLastName(peer.UserID)
-		username, _ := cache.UserUsername(peer.UserID)
-		// Формируем полное имя. Если оно пустое, используем безопасный плейсхолдер.
-		fullname := strings.TrimSpace(first + " " + last)
+		var (
+			first    string
+			last     string
+			username = "-"
+		)
+		if resolved := lookupPeer(mgr, peersmgr.DialogKindUser, peer.UserID); resolved != nil {
+			if u, ok := resolved.(tdpeers.User); ok {
+				raw := u.Raw()
+				first = strings.TrimSpace(raw.FirstName)
+				last = strings.TrimSpace(raw.LastName)
+				if val := strings.TrimPrefix(raw.Username, "@"); val != "" {
+					username = val
+				}
+			}
+		}
+		fullname := strings.TrimSpace(strings.Join([]string{first, last}, " "))
 		if fullname == "" {
 			fullname = "<unknown>"
 		}
 		from = "User"
 		name = fmt.Sprintf("'%s' (@%s)", fullname, username)
 	case *tg.PeerChat:
-		title, _ := cache.ChatTitle(peer.ChatID)
-		if title == "" {
-			title = "<unknown chat>"
+		title := "<unknown chat>"
+		if resolved := lookupPeer(mgr, peersmgr.DialogKindChat, peer.ChatID); resolved != nil {
+			if ch, ok := resolved.(tdpeers.Chat); ok {
+				raw := ch.Raw()
+				if strings.TrimSpace(raw.Title) != "" {
+					title = strings.TrimSpace(raw.Title)
+				}
+			}
 		}
 		from = "Chat"
 		name = fmt.Sprintf("'%s'", title)
 
 	case *tg.PeerChannel:
-		title, _ := cache.ChannelTitle(peer.ChannelID)
-		username, _ := cache.ChannelUsername(peer.ChannelID)
-		broadcast, megagroup, _ := cache.ChannelFlags(peer.ChannelID)
+		title := "<untitled channel>"
+		username := "-"
+		var broadcast, megagroup bool
+		if resolved := lookupPeer(mgr, peersmgr.DialogKindChannel, peer.ChannelID); resolved != nil {
+			if ch, ok := resolved.(tdpeers.Channel); ok {
+				raw := ch.Raw()
+				if strings.TrimSpace(raw.Title) != "" {
+					title = strings.TrimSpace(raw.Title)
+				}
+				if val := strings.TrimPrefix(raw.Username, "@"); val != "" {
+					username = val
+				}
+				broadcast = raw.Broadcast
+				megagroup = raw.Megagroup
+			}
+		}
 		// У каналов/супергрупп различаем два режима для наглядного лейбла.
 		label := "Channel-like"
 		if broadcast {
@@ -96,6 +127,17 @@ func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities) {
 
 	// Финальный вывод одной строки: префикс, тип отправителя, имя и урезанный текст.
 	pr.Printf("[%s] %s > %s: %s\n", prefix, from, name, text)
+}
+
+func lookupPeer(service *peersmgr.Service, kind peersmgr.DialogKind, id int64) tdpeers.Peer {
+	if service == nil {
+		return nil
+	}
+	peer, ok, err := service.ResolvePeer(context.Background(), kind, id)
+	if err != nil || !ok {
+		return nil
+	}
+	return peer
 }
 
 // Debug пишет запись уровня Debug в общий лог только при активном DEBUG.

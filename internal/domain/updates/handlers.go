@@ -22,7 +22,7 @@ import (
 	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/support/debug"
 
 	"telegram-userbot/internal/infra/config"
@@ -50,6 +50,7 @@ type Handlers struct {
 	debouncer *concurrency.Debouncer    // debouncer сглаживает частые обновления одного сообщения (редактирования)
 	unread    map[int64]int             // unread хранит счётчики непрочитанных сообщений по пирами
 	unreadMu  sync.Mutex                // unreadMu синхронизирует конкурентные обновления карты unread
+	peers     *peersmgr.Service         // peers предоставляет доступ к менеджеру пиров и локальному снапшоту
 
 	notifiedCacheFile string
 	notifiedDirty     bool
@@ -73,7 +74,7 @@ type Handlers struct {
 // Возвращает полностью инициализированную структуру без запуска фоновых горутин.
 func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
 	dup *concurrency.Deduplicator, debouncer *concurrency.Debouncer,
-	shutdown func()) *Handlers {
+	shutdown func(), peers *peersmgr.Service) *Handlers {
 	cfg := config.Env()
 	return &Handlers{
 		api:               api,
@@ -86,6 +87,7 @@ func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notificat
 		cleanTTL:          time.Duration(cfg.NotifiedTTLDays) * 24 * time.Hour,
 		shutdown:          shutdown,
 		notifiedCacheFile: cfg.NotifiedCacheFile,
+		peers:             peers,
 	}
 }
 
@@ -165,8 +167,6 @@ func (h *Handlers) OnNewMessage(
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
 	// сама добавит недостающие сущности в кэш на будущее.
-	_, _ = cache.GetInputPeerRaw(entities, msg)
-
 	// Быстрая защита от повторной обработки: та же комбинация
 	// (peerID, msgID, editDate) уже приходила и была обработана.
 	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
@@ -186,7 +186,7 @@ func (h *Handlers) OnNewMessage(
 	}
 
 	logger.Debug("OnNewMessage")
-	debug.PrintUpdate("DM/Group", msg, entities)
+	debug.PrintUpdate("DM/Group", msg, entities, h.peers)
 	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
@@ -222,14 +222,12 @@ func (h *Handlers) OnNewChannelMessage(
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
 	// сама добавит недостающие сущности в кэш на будущее.
-	_, _ = cache.GetInputPeerRaw(entities, msg)
-
 	// Дедупликация по (peerID, msgID, editDate) для каналов.
 	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
 		return nil
 	}
 	logger.Debug("OnNewChannelMessage")
-	debug.PrintUpdate("Channel", msg, entities)
+	debug.PrintUpdate("Channel", msg, entities, h.peers)
 	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
@@ -262,7 +260,7 @@ func (h *Handlers) OnEditMessage(
 	}
 	// logger.Warnf("msg: %v", pr.Pf(msg))
 	logger.Debug("OnEditMessage")
-	debug.PrintUpdate("OnEditMessage", msg, entities)
+	debug.PrintUpdate("OnEditMessage", msg, entities, h.peers)
 	// Дебаунсим лавину апдейтов при частых правках одного и того же сообщения.
 	h.debouncer.Do(msg.ID, func() {
 		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
@@ -295,7 +293,7 @@ func (h *Handlers) OnEditChannelMessage(
 		return nil
 	}
 	logger.Debug("OnEditChannelMessage")
-	debug.PrintUpdate("OnEditChannelMessage", msg, entities)
+	debug.PrintUpdate("OnEditChannelMessage", msg, entities, h.peers)
 	// Дебаунсим частые правки сообщений канала, чтобы не заспамить очередь.
 	h.debouncer.Do(msg.ID, func() {
 		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
