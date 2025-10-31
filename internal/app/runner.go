@@ -14,18 +14,20 @@ import (
 
 	"telegram-userbot/internal/adapters/cli"
 	"telegram-userbot/internal/adapters/telegram/core"
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	domainupdates "telegram-userbot/internal/domain/updates"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/lifecycle"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 
 	"telegram-userbot/internal/infra/telegram/status"
 
 	tgupdates "github.com/gotd/td/telegram/updates"
+	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 )
 
@@ -36,13 +38,15 @@ import (
 //   - корректное завершение: сначала останавливаются узлы (статусы/очереди), затем гасится MTProto‑движок,
 //   - интеграцию с CLI и доменными обработчиками обновлений.
 type Runner struct {
-	cl    *core.ClientCore          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
-	notif *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
-	dedup *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
-	deb   *concurrency.Debouncer    // Сглаживание/слияние частых событий (например, всплесков апдейтов).
-	h     *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
-	ctx   context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
-	stop  context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
+	cl      *core.ClientCore          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
+	filters *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
+	notif   *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
+	dedup   *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
+	deb     *concurrency.Debouncer    // Сглаживание/слияние частых событий (например, всплесков апдейтов).
+	h       *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
+	ctx     context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
+	stop    context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
+	peers   *peersmgr.Service         // Сервис пиров (peers.Manager + persist storage).
 }
 
 // NewRunner подготавливает Runner с переданными зависимостями: ядро клиента, очередь уведомлений,
@@ -51,19 +55,23 @@ func NewRunner(
 	ctx context.Context,
 	stop context.CancelFunc,
 	cl *core.ClientCore,
+	filters *filters.FilterEngine,
 	notif *notifications.Queue,
 	dedup *concurrency.Deduplicator,
 	debouncer *concurrency.Debouncer,
 	handlers *domainupdates.Handlers,
+	peers *peersmgr.Service,
 ) *Runner {
 	return &Runner{
-		ctx:   ctx,
-		stop:  stop,
-		cl:    cl,
-		notif: notif,
-		dedup: dedup,
-		deb:   debouncer,
-		h:     handlers,
+		ctx:     ctx,
+		stop:    stop,
+		cl:      cl,
+		filters: filters,
+		notif:   notif,
+		dedup:   dedup,
+		deb:     debouncer,
+		h:       handlers,
+		peers:   peers,
 	}
 }
 
@@ -73,92 +81,110 @@ func NewRunner(
 // корректно завершиться до гашения сетевого уровня.
 func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 	clientCtx, clientCancel := context.WithCancel(context.Background())
-
-	// Отдельный контекст именно для MTProto‑движка. Мы не привязываем его к r.ctx,
-	// чтобы уметь сначала останавливать прикладные узлы (status/queue/handlers),
-	// а уже затем отменять сетевой слой. Это устраняет гонку: "engine закрыт → статус offline не ушёл".
-
 	defer clientCancel()
 
 	return r.cl.Client.Run(clientCtx, func(ctx context.Context) error {
-		// Точка входа в клиентскую сессию. Всё внутри выполняется, пока жив clientCtx.
-
 		logger.Info("Userbot running...")
 
-		// Загружаем профиль текущего аккаунта (Self). Нужен для логов и параметров updates.Manager.
-		if loginErr := r.cl.Login(ctx); loginErr != nil {
+		self, loginErr := r.loginSelf(ctx)
+		if loginErr != nil {
 			return loginErr
 		}
 
-		self, selfErr := r.cl.Client.Self(ctx)
-		if selfErr != nil {
-			return selfErr
-		}
-
-		logger.Logger().Info("Logged in as:",
-			zap.String("FirstName", self.FirstName),
-			zap.String("Username", self.Username),
-			zap.Int64("ID", self.ID),
-		)
-
-		// Прогреваем кэш пиров заранее: обработчики обновлений смогут быстрее резолвить участников/диалоги.
-		if cacheErr := cache.BuildPeerCache(); cacheErr != nil {
-			logger.Errorf("failed to build peer cache: %v", cacheErr)
-			if config.Env().Notifier != "bot" {
-				logger.Error("peer cache error, cant use client notifier")
-				return cacheErr
-			}
-		}
-
-		logger.Debug("BuildPeerCache: ok")
-
-		// lifecycle.Manager управляет узлами с зависимостями: Register → StartAll → Shutdown.
-		// Здесь контекстом для узлов служит контекст MTProto‑движка, чтобы узлы завершались раньше engine.
-
-		lc := lifecycle.New(ctx)
-
-		if err := r.registerClientNodes(ctx, lc, updmgr, self.ID); err != nil {
+		if err := r.initPeersIfNeeded(ctx); err != nil {
 			return err
 		}
 
-		if err := lc.StartAll(); err != nil {
-			_ = lc.Shutdown()
+		lc, err := r.buildLifecycle(ctx, updmgr, self.ID)
+		if err != nil {
 			return err
 		}
 
-		// ОРКЕСТРАЦИЯ ЗАВЕРШЕНИЯ:
-		// Используем sync.WaitGroup.Go для симметрии Add/Done и читаемости.
-		// Порядок: 1) ждём r.ctx.Done(); 2) мягко глушим узлы lc.Shutdown(); 3) отменяем clientCtx.
-		// Ждём отмены внешнего контекста r.ctx (Ctrl+C или r.stop()),
-		// инициализируем управляемый shutdown узлов, и только после его завершения
-		// отменяем контекст MTProto-движка (clientCancel). Это даёт шанс StatusManager
-		// отправить AccountUpdateStatus(offline), пока движок ещё жив.
-		var wg sync.WaitGroup
-		shutdownTriggered := make(chan struct{})
-		wg.Go(func() {
-			<-r.ctx.Done()
-			_ = lc.Shutdown() // запускаем остановку узлов при ещё живом engine
-			clientCancel()    // после остановки узлов — гасим движок
-			close(shutdownTriggered)
-		})
-
-		// Дожидаемся завершения clientCtx (engine). Это произойдёт либо после
-		// нашего clientCancel(), либо из-за внутренней ошибки движка.
-		<-ctx.Done()
-
-		// Если shutdown не был инициирован внешним контекстом (например, engine умер сам),
-		// корректно остановим узлы здесь.
-		select {
-		case <-shutdownTriggered:
-			// уже остановили выше
-		default:
-			_ = lc.Shutdown()
-		}
-		wg.Wait()
-
-		// Возвращаем ошибку контекста движка (для логов верхнего уровня).
-		return ctx.Err()
+		return r.runLifecycleLoop(ctx, lc, clientCancel)
 	})
+}
+
+func (r *Runner) loginSelf(ctx context.Context) (*tg.User, error) {
+	if err := r.cl.Login(ctx); err != nil {
+		return nil, err
+	}
+	self, err := r.cl.Client.Self(ctx)
+	if err != nil {
+		return nil, err
+	}
+	logger.Logger().Info("Logged in as:",
+		zap.String("FirstName", self.FirstName),
+		zap.String("Username", self.Username),
+		zap.Int64("ID", self.ID),
+	)
+	return self, nil
+}
+
+func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
+	if r.peers == nil {
+		return nil
+	}
+
+	if err := r.peers.Mgr.Init(ctx); err != nil {
+		logger.Errorf("failed to init peers manager: %v", err)
+		if config.Env().Notifier == notifierClient {
+			return err
+		}
+	}
+
+	if err := r.peers.LoadFromStorage(ctx); err != nil {
+		logger.Errorf("failed to load peers from storage: %v", err)
+	}
+
+	if err := r.peers.WarmupIfEmpty(ctx, r.cl.API); err != nil {
+		logger.Errorf("failed to warm up peers manager: %v", err)
+		if config.Env().Notifier == notifierClient {
+			logger.Error("peers warmup error, cant use client notifier")
+			return err
+		}
+	}
+
+	logger.Debug("Peers warmup complete")
+	return nil
+}
+
+func (r *Runner) buildLifecycle(
+	ctx context.Context,
+	updmgr *tgupdates.Manager,
+	selfID int64,
+) (*lifecycle.Manager, error) {
+	lc := lifecycle.New(ctx)
+	if err := r.registerClientNodes(ctx, lc, updmgr, selfID); err != nil {
+		return nil, err
+	}
+	if err := lc.StartAll(); err != nil {
+		_ = lc.Shutdown()
+		return nil, err
+	}
+	return lc, nil
+}
+
+func (r *Runner) runLifecycleLoop(ctx context.Context, lc *lifecycle.Manager, clientCancel context.CancelFunc) error {
+	var wg sync.WaitGroup
+	shutdownTriggered := make(chan struct{})
+
+	wg.Go(func() {
+		<-r.ctx.Done()
+		_ = lc.Shutdown()
+		clientCancel()
+		close(shutdownTriggered)
+	})
+
+	<-ctx.Done()
+
+	select {
+	case <-shutdownTriggered:
+	default:
+		_ = lc.Shutdown()
+	}
+
+	wg.Wait()
+	return ctx.Err()
 }
 
 // handleUpdatesManagerStart вызывается updates.Manager при старте обработки апдейтов.
@@ -197,6 +223,22 @@ func (r *Runner) registerClientNodes(
 	updmgr *tgupdates.Manager,
 	selfID int64,
 ) error {
+	if r.peers != nil {
+		if err := lc.Register(
+			"peers_manager",
+			"",
+			nil,
+			func(nodeCtx context.Context) (context.Context, error) {
+				return nodeCtx, nil
+			},
+			func(context.Context) error {
+				return r.peers.Close()
+			},
+		); err != nil {
+			return err
+		}
+	}
+
 	// Узел: connection_manager
 	// Инициализирует и публикует текущее соединение/контекст клиента для других подсистем.
 	// Без зависимостей, так как сам предоставляет базовую инфраструктуру.
@@ -358,7 +400,7 @@ func (r *Runner) registerClientNodes(
 
 	// Узел: cli
 	// Сервис интерактивных команд. Не блокирует основную петлю, но может инициировать shutdown через r.stop().
-	cliService := cli.NewService(r.cl, r.stop, r.notif)
+	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif, r.peers)
 	if err := lc.Register(
 		"cli",
 		"",

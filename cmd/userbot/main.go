@@ -38,12 +38,11 @@ func main() {
 
 	// envPath определяет расположение .env с секретами и общими настройками.
 	envPath := flag.String("env", "assets/.env", "path to .env file")
-	// filtersPath указывает на JSON-файл с фильтрами, используемыми userbot.
-	filtersPath := flag.String("filters", "assets/filters.json", "path to filters.json")
+	// // filtersPath указывает на JSON-файл с фильтрами, используемыми userbot.
 	flag.Parse()
 
-	// config.Load собирает финальную конфигурацию из файла окружения и набора фильтров.
-	if err := config.Load(*envPath, *filtersPath); err != nil {
+	// config.Load загружает конфигурацию из .env и других источников.
+	if err := config.Load(*envPath); err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 

@@ -15,8 +15,8 @@ import (
 
 	"telegram-userbot/internal/domain/notifications"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	telegramruntime "telegram-userbot/internal/infra/telegram/runtime"
 	"telegram-userbot/internal/infra/telegram/status"
 	"telegram-userbot/internal/infra/throttle"
@@ -62,12 +62,16 @@ func (e *stopRetryError) Reason() stopRetryReason { return e.reason }
 type ClientSender struct {
 	api     *tg.Client
 	limiter *throttle.Throttler
+	peers   *peersmgr.Service
 }
 
 // NewClientSender создаёт PreparedSender, оборачивая tg.Client троттлером.
 // Параметр rps задаёт целевую среднюю частоту запросов. Подключён
 // FloodWaitExtractor для корректной паузы при FLOOD_WAIT/FLOOD_PREMIUM_WAIT.
-func NewClientSender(api *tg.Client, rps int) *ClientSender {
+func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSender {
+	if peers == nil {
+		panic("ClientSender: peers manager must not be nil")
+	}
 	// Троттлер ограничивает RPS и умеет извлекать обязательные паузы из FLOOD_WAIT.
 	throttler := throttle.New(
 		rps,
@@ -77,6 +81,7 @@ func NewClientSender(api *tg.Client, rps int) *ClientSender {
 	return &ClientSender{
 		api:     api,
 		limiter: throttler,
+		peers:   peers,
 	}
 }
 
@@ -125,7 +130,7 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	needForward := fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0
 
 	for idx, recipient := range job.Recipients {
-		peer, errPeer := cache.GetInputPeerByKind(recipient.Type, recipient.ID)
+		peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
 		if errPeer != nil {
 			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
@@ -265,7 +270,7 @@ func (s *ClientSender) apiForwardMessages(
 	toPeer tg.InputPeerClass,
 ) error {
 	fwd := job.Payload.Forward
-	fromPeer, err := cache.GetInputPeerByKind(fwd.FromPeer.Type, fwd.FromPeer.ID)
+	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
 	if err != nil {
 		return &stopRetryError{
 			err:    fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err),
@@ -350,7 +355,6 @@ func isPermanentRPCError(err error) bool {
 // 	var outcome notifications.SendOutcome
 
 // 	for idx, recipient := range job.Recipients {
-// 		peer, errPeer := cache.GetInputPeerByKind(recipient.Type, recipient.ID)
 // 		if errPeer != nil {
 // 			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
 // 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)

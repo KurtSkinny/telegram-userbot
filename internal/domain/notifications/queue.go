@@ -17,9 +17,10 @@ import (
 	"time"
 
 	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/infra/config"
+	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 
 	"github.com/gotd/td/tg"
 )
@@ -61,6 +62,7 @@ type QueueOptions struct {
 	Schedule []string
 	Location *time.Location
 	Clock    func() time.Time
+	Peers    *peersmgr.Service
 }
 
 // scheduleEntry — нормализованный слот расписания в локальной таймзоне.
@@ -101,6 +103,7 @@ type Queue struct {
 	failed   *FailedStore
 	location *time.Location
 	schedule []scheduleEntry
+	peers    *peersmgr.Service
 
 	mu    sync.Mutex
 	state State
@@ -161,6 +164,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		failed:    opts.Failed,
 		location:  location,
 		schedule:  schedule,
+		peers:     opts.Peers,
 		state:     state,
 		urgentCh:  make(chan struct{}, 1),
 		regularCh: make(chan drainSignal, 1),
@@ -267,7 +271,7 @@ func (q *Queue) Notify(
 		return errors.New("notifications queue: empty recipients list")
 	}
 
-	link := BuildMessageLink(entities, msg)
+	link := BuildMessageLink(q.peers, entities, msg)
 	text := RenderTemplate(fres.Filter.Notify.Template, fres.Result, link)
 
 	job := Job{
@@ -738,7 +742,7 @@ func (q *Queue) previousScheduleAt(now time.Time) time.Time {
 }
 
 // buildRecipientsFromTargets собирает получателей из users/chats/channels и устраняет дубликаты по (Type, ID).
-func buildRecipientsFromTargets(t config.RecipientTargets) []Recipient {
+func buildRecipientsFromTargets(t recipients.RecipientTargets) []Recipient {
 	total := len(t.Users) + len(t.Chats) + len(t.Channels)
 	out := make([]Recipient, 0, total)
 	seen := make(map[string]struct{}, total)
