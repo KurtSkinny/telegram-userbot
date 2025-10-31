@@ -117,6 +117,8 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	}
 	a.cl = cl
 
+	// todo: заменить на готовый peerscache manager из contrib
+	// путь до файла config.Env().PeersCacheFile
 	// Инициализация кэша пиров: ускоряет резолв пользователей/диалогов в обработчиках.
 	cache.Init(ctx, cl.API)
 

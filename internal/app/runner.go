@@ -105,6 +105,7 @@ func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 			zap.Int64("ID", self.ID),
 		)
 
+		// todo: заменить на готовый peerscache manager из contrib
 		// Прогреваем кэш пиров заранее: обработчики обновлений смогут быстрее резолвить участников/диалоги.
 		if cacheErr := cache.BuildPeerCache(); cacheErr != nil {
 			logger.Errorf("failed to build peer cache: %v", cacheErr)
