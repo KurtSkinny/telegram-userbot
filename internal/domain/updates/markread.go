@@ -81,7 +81,6 @@ func (h *Handlers) runMarkReadScheduler(ctx context.Context) {
 func (h *Handlers) flushUnread(ctx context.Context) {
 	h.unreadMu.Lock()
 	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для разрешения через peers менеджер.
-	entities := tg.Entities{}
 	messages := []*tg.Message{}
 
 	for peerID, maxID := range h.unread {
@@ -141,7 +140,7 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 
 	for i, msg := range messages {
 		// Помечаем диалог как прочитанный до msg.ID. Между чатами — пауза.
-		h.markRead(ctx, entities, msg)
+		h.markRead(ctx, msg)
 		if i < len(messages)-1 {
 			tgruntime.WaitRandomTimeMs(ctx, readDelayMinMs, readDelayMaxMs)
 		}
@@ -158,7 +157,7 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 //
 // Перед каждым вызовом дожидается онлайна, ошибки пробрасывает в connection.HandleError
 // и при успехе синхронизирует локальный кэш lastUnreadCache, чтобы не повторять работу.
-func (h *Handlers) markRead(ctx context.Context, entities tg.Entities, msg *tg.Message) {
+func (h *Handlers) markRead(ctx context.Context, msg *tg.Message) {
 	if h.peers == nil {
 		logger.Error("markRead: peers manager is not available")
 		return

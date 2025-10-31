@@ -27,6 +27,8 @@ import (
 // что прод‑сборка запускается с DEBUG=false.
 var DEBUG = true
 
+const textPreviewLimit = 50
+
 // PrintUpdate печатает компактное представление входящего сообщения в консоль.
 // Формат: [prefix] <источник> > <читаемое имя>: <обрезанный текст>.
 // Особенности:
@@ -39,105 +41,147 @@ func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities, mgr *peer
 		// Отладка выключена — ничего не делаем. Этот ранний выход упраздняет лишнюю работу.
 		return
 	}
-	var from string
-	var name string
-	text := msg.Message
-
-	// Ограничиваем размер вывода, чтобы не раздувать консоль длинными сообщениями.
-	const textMaxLen = 50
-
-	// Считаем и обрезаем по рунам, а не по байтам, чтобы не порвать Unicode‑символы.
-	// Специально используем слайс рун, а не substring по байтам.
-	if utf8.RuneCountInString(text) > textMaxLen {
-		runes := []rune(text)
-		text = string(runes[:textMaxLen]) + "..."
-	}
-
-	// Определяем тип собеседника/чата и вытягиваем читабельные имена из кэша.
-	switch peer := msg.PeerID.(type) {
-	case *tg.PeerUser:
-		var (
-			first    string
-			last     string
-			username = "-"
-		)
-		if resolved := lookupPeer(mgr, peersmgr.DialogKindUser, peer.UserID); resolved != nil {
-			if u, ok := resolved.(tdpeers.User); ok {
-				raw := u.Raw()
-				first = strings.TrimSpace(raw.FirstName)
-				last = strings.TrimSpace(raw.LastName)
-				if val := strings.TrimPrefix(raw.Username, "@"); val != "" {
-					username = val
-				}
-			}
-		}
-		fullname := strings.TrimSpace(strings.Join([]string{first, last}, " "))
-		if fullname == "" {
-			fullname = "<unknown>"
-		}
-		from = "User"
-		name = fmt.Sprintf("'%s' (@%s)", fullname, username)
-	case *tg.PeerChat:
-		title := "<unknown chat>"
-		if resolved := lookupPeer(mgr, peersmgr.DialogKindChat, peer.ChatID); resolved != nil {
-			if ch, ok := resolved.(tdpeers.Chat); ok {
-				raw := ch.Raw()
-				if strings.TrimSpace(raw.Title) != "" {
-					title = strings.TrimSpace(raw.Title)
-				}
-			}
-		}
-		from = "Chat"
-		name = fmt.Sprintf("'%s'", title)
-
-	case *tg.PeerChannel:
-		title := "<untitled channel>"
-		username := "-"
-		var broadcast, megagroup bool
-		if resolved := lookupPeer(mgr, peersmgr.DialogKindChannel, peer.ChannelID); resolved != nil {
-			if ch, ok := resolved.(tdpeers.Channel); ok {
-				raw := ch.Raw()
-				if strings.TrimSpace(raw.Title) != "" {
-					title = strings.TrimSpace(raw.Title)
-				}
-				if val := strings.TrimPrefix(raw.Username, "@"); val != "" {
-					username = val
-				}
-				broadcast = raw.Broadcast
-				megagroup = raw.Megagroup
-			}
-		}
-		// У каналов/супергрупп различаем два режима для наглядного лейбла.
-		label := "Channel-like"
-		if broadcast {
-			label = "Channel"
-		} else if megagroup {
-			label = "Supergroup"
-		}
-		if title == "" {
-			title = "<untitled channel>"
-		}
-		from = label
-		name = fmt.Sprintf("'%s' (@%s)", title, username)
-	default:
-		// На случай редких/новых типов peer — печатаем отладочную форму.
-		from = "Unknown"
-		name = fmt.Sprintf("%+v", peer)
-	}
-
-	// Финальный вывод одной строки: префикс, тип отправителя, имя и урезанный текст.
+	from, name := formatPeer(mgr, msg.PeerID)
+	text := shortenMessage(msg.Message)
 	pr.Printf("[%s] %s > %s: %s\n", prefix, from, name, text)
 }
 
-func lookupPeer(service *peersmgr.Service, kind peersmgr.DialogKind, id int64) tdpeers.Peer {
-	if service == nil {
+func shortenMessage(text string) string {
+	if utf8.RuneCountInString(text) <= textPreviewLimit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:textPreviewLimit]) + "..."
+}
+
+func formatPeer(mgr *peersmgr.Service, peer tg.PeerClass) (string, string) {
+	switch p := peer.(type) {
+	case *tg.PeerUser:
+		return userLabel(mgr, p.UserID)
+	case *tg.PeerChat:
+		return chatLabel(mgr, p.ChatID)
+	case *tg.PeerChannel:
+		return channelLabel(mgr, p.ChannelID)
+	default:
+		return "Unknown", fmt.Sprintf("%+v", peer)
+	}
+}
+
+func userLabel(mgr *peersmgr.Service, id int64) (string, string) {
+	raw := getUser(mgr, id)
+	fullname := "<unknown>"
+	if raw != nil {
+		first := strings.TrimSpace(raw.FirstName)
+		last := strings.TrimSpace(raw.LastName)
+		if combined := strings.TrimSpace(strings.Join([]string{first, last}, " ")); combined != "" {
+			fullname = combined
+		}
+	}
+	return "User", fmt.Sprintf("'%s' (@%s) id: %d", fullname, usernameFromUser(raw), id)
+}
+
+func chatLabel(mgr *peersmgr.Service, id int64) (string, string) {
+	title := "<unknown chat>"
+	if raw := getChat(mgr, id); raw != nil {
+		if trimmed := strings.TrimSpace(raw.Title); trimmed != "" {
+			title = trimmed
+		}
+	}
+	return "Chat", fmt.Sprintf("'%s' id: %d", title, id)
+}
+
+func channelLabel(mgr *peersmgr.Service, id int64) (string, string) {
+	raw := getChannel(mgr, id)
+	title := "<untitled channel>"
+	if raw != nil {
+		if trimmed := strings.TrimSpace(raw.Title); trimmed != "" {
+			title = trimmed
+		}
+	}
+	label := channelType(raw)
+	return label, fmt.Sprintf("'%s' (@%s) id: %d", title, usernameFromChannel(raw), id)
+}
+
+func channelType(raw *tg.Channel) string {
+	switch {
+	case raw == nil:
+		return "Channel-like"
+	case raw.Broadcast:
+		return "Channel"
+	case raw.Megagroup:
+		return "Supergroup"
+	default:
+		return "Channel-like"
+	}
+}
+
+func getUser(mgr *peersmgr.Service, id int64) *tg.User {
+	if mgr == nil {
 		return nil
 	}
-	peer, ok, err := service.ResolvePeer(context.Background(), kind, id)
+	peer, ok, err := mgr.ResolvePeer(context.Background(), peersmgr.DialogKindUser, id)
 	if err != nil || !ok {
 		return nil
 	}
-	return peer
+	user, ok := peer.(tdpeers.User)
+	if !ok {
+		return nil
+	}
+	return user.Raw()
+}
+
+func getChat(mgr *peersmgr.Service, id int64) *tg.Chat {
+	if mgr == nil {
+		return nil
+	}
+	peer, ok, err := mgr.ResolvePeer(context.Background(), peersmgr.DialogKindChat, id)
+	if err != nil || !ok {
+		return nil
+	}
+	chat, ok := peer.(tdpeers.Chat)
+	if !ok {
+		return nil
+	}
+	return chat.Raw()
+}
+
+func getChannel(mgr *peersmgr.Service, id int64) *tg.Channel {
+	if mgr == nil {
+		return nil
+	}
+	peer, ok, err := mgr.ResolvePeer(context.Background(), peersmgr.DialogKindChannel, id)
+	if err != nil || !ok {
+		return nil
+	}
+	channel, ok := peer.(tdpeers.Channel)
+	if !ok {
+		return nil
+	}
+	return channel.Raw()
+}
+
+func usernameFromUser(raw *tg.User) string {
+	if raw == nil {
+		return "-"
+	}
+	if val := strings.TrimSpace(raw.Username); val != "" {
+		if cleaned := strings.TrimPrefix(val, "@"); cleaned != "" {
+			return cleaned
+		}
+	}
+	return "-"
+}
+
+func usernameFromChannel(raw *tg.Channel) string {
+	if raw == nil {
+		return "-"
+	}
+	if val := strings.TrimSpace(raw.Username); val != "" {
+		if cleaned := strings.TrimPrefix(val, "@"); cleaned != "" {
+			return cleaned
+		}
+	}
+	return "-"
 }
 
 // Debug пишет запись уровня Debug в общий лог только при активном DEBUG.

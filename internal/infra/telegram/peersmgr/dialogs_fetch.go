@@ -125,9 +125,8 @@ func updateHashesFromBatch(batch *tg.MessagesDialogs, userHashes, channelHashes 
 		}
 	}
 	for _, entity := range batch.Chats {
-		switch item := entity.(type) {
-		case *tg.Channel:
-			channelHashes[item.ID] = item.AccessHash
+		if channel, ok := entity.(*tg.Channel); ok {
+			channelHashes[channel.ID] = channel.AccessHash
 		}
 	}
 }

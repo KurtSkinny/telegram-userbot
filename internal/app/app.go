@@ -54,7 +54,11 @@ type App struct {
 
 // CleanPeriodHours — периодичность очистки внутренних фильтров/кэшей уведомлений (часы),
 // чтобы не накапливать устаревшие записи во время длительной работы.
-const CleanPeriodHours = 24
+const (
+	CleanPeriodHours = 24
+	notifierClient   = "client"
+	notifierBot      = "bot"
+)
 
 // NewApp создаёт пустой каркас приложения. Фактическая инициализация выполняется в Init().
 func NewApp() *App {
@@ -141,8 +145,8 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 	// Инициализация и загрузка фильтров
 	a.filters = filters.NewFilterEngine(config.Env().FiltersFile)
-	if err := a.filters.Load(); err != nil {
-		return fmt.Errorf("load filters: %w", err)
+	if loadErr := a.filters.Load(); loadErr != nil {
+		return fmt.Errorf("load filters: %w", loadErr)
 	}
 	logger.Infof("Filters loaded: %d total, %d unique chats",
 		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
@@ -166,9 +170,9 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	// Выбор транспорта уведомлений: client (userbot) или bot (Bot API).
 	var sender notifications.PreparedSender
 	switch config.Env().Notifier {
-	case "client":
+	case notifierClient:
 		sender = telegramnotifier.NewClientSender(a.cl.API, config.Env().ThrottleRPS, a.peers)
-	case "bot":
+	case notifierBot:
 		sender = botapionotifier.NewBotSender(config.Env().BotToken, config.Env().TestDC, config.Env().ThrottleRPS)
 	default:
 		return errors.New(`invalid NOTIFIER option in .env (must be "client" or "bot")`)

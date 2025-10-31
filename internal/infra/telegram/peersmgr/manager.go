@@ -79,7 +79,7 @@ func New(api *tg.Client, dbPath string) (*Service, error) {
 
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("peersmgr: ensure dir %q: %w", dir, err)
 		}
 	}
@@ -199,6 +199,8 @@ func (s *Service) LookupPeer(ctx context.Context, kind DialogKind, id int64) (co
 		key = contribstorage.PeerKey{Kind: dialogs.Chat, ID: id}
 	case DialogKindChannel:
 		key = contribstorage.PeerKey{Kind: dialogs.Channel, ID: id}
+	case DialogKindFolder:
+		return contribstorage.Peer{}, false, nil
 	default:
 		return contribstorage.Peer{}, false, nil
 	}
@@ -303,31 +305,6 @@ func (s *Service) ResolvePeer(ctx context.Context, kind DialogKind, id int64) (p
 	default:
 		return nil, false, fmt.Errorf("peersmgr: unsupported dialog kind %q", kind)
 	}
-}
-
-func (s *Service) applyEntities(ctx context.Context, entities tg.Entities) error {
-	if len(entities.Users) == 0 && len(entities.Chats) == 0 {
-		return nil
-	}
-
-	users := make([]tg.UserClass, 0, len(entities.Users))
-	for _, u := range entities.Users {
-		if u != nil {
-			users = append(users, u)
-		}
-	}
-
-	chats := make([]tg.ChatClass, 0, len(entities.Chats))
-	for _, ch := range entities.Chats {
-		if ch != nil {
-			chats = append(chats, ch)
-		}
-	}
-
-	if len(users) == 0 && len(chats) == 0 {
-		return nil
-	}
-	return s.Mgr.Apply(ctx, users, chats)
 }
 
 // RefreshDialogs пере Fetch диалогов, обновляет peers.Manager, персистентное хранилище и снимок.

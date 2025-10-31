@@ -27,6 +27,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/status"
 
 	tgupdates "github.com/gotd/td/telegram/updates"
+	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 )
 
@@ -80,98 +81,106 @@ func NewRunner(
 // корректно завершиться до гашения сетевого уровня.
 func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 	clientCtx, clientCancel := context.WithCancel(context.Background())
-
-	// Отдельный контекст именно для MTProto‑движка. Мы не привязываем его к r.ctx,
-	// чтобы уметь сначала останавливать прикладные узлы (status/queue/handlers),
-	// а уже затем отменять сетевой слой. Это устраняет гонку: "engine закрыт → статус offline не ушёл".
-
 	defer clientCancel()
 
 	return r.cl.Client.Run(clientCtx, func(ctx context.Context) error {
-		// Точка входа в клиентскую сессию. Всё внутри выполняется, пока жив clientCtx.
-
 		logger.Info("Userbot running...")
 
-		// Загружаем профиль текущего аккаунта (Self). Нужен для логов и параметров updates.Manager.
-		if loginErr := r.cl.Login(ctx); loginErr != nil {
+		self, loginErr := r.loginSelf(ctx)
+		if loginErr != nil {
 			return loginErr
 		}
 
-		self, selfErr := r.cl.Client.Self(ctx)
-		if selfErr != nil {
-			return selfErr
-		}
-
-		logger.Logger().Info("Logged in as:",
-			zap.String("FirstName", self.FirstName),
-			zap.String("Username", self.Username),
-			zap.Int64("ID", self.ID),
-		)
-
-		if r.peers != nil {
-			if initErr := r.peers.Mgr.Init(ctx); initErr != nil {
-				logger.Errorf("failed to init peers manager: %v", initErr)
-				if config.Env().Notifier != "bot" {
-					return initErr
-				}
-			}
-			if warmErr := r.peers.WarmupIfEmpty(ctx, r.cl.API); warmErr != nil {
-				logger.Errorf("failed to warm up peers manager: %v", warmErr)
-				if config.Env().Notifier != "bot" {
-					logger.Error("peers warmup error, cant use client notifier")
-					return warmErr
-				}
-			}
-			logger.Debug("Peers warmup complete")
-		}
-
-		// lifecycle.Manager управляет узлами с зависимостями: Register → StartAll → Shutdown.
-		// Здесь контекстом для узлов служит контекст MTProto‑движка, чтобы узлы завершались раньше engine.
-
-		lc := lifecycle.New(ctx)
-
-		if err := r.registerClientNodes(ctx, lc, updmgr, self.ID); err != nil {
+		if err := r.initPeersIfNeeded(ctx); err != nil {
 			return err
 		}
 
-		if err := lc.StartAll(); err != nil {
-			_ = lc.Shutdown()
+		lc, err := r.buildLifecycle(ctx, updmgr, self.ID)
+		if err != nil {
 			return err
 		}
 
-		// ОРКЕСТРАЦИЯ ЗАВЕРШЕНИЯ:
-		// Используем sync.WaitGroup.Go для симметрии Add/Done и читаемости.
-		// Порядок: 1) ждём r.ctx.Done(); 2) мягко глушим узлы lc.Shutdown(); 3) отменяем clientCtx.
-		// Ждём отмены внешнего контекста r.ctx (Ctrl+C или r.stop()),
-		// инициализируем управляемый shutdown узлов, и только после его завершения
-		// отменяем контекст MTProto-движка (clientCancel). Это даёт шанс StatusManager
-		// отправить AccountUpdateStatus(offline), пока движок ещё жив.
-		var wg sync.WaitGroup
-		shutdownTriggered := make(chan struct{})
-		wg.Go(func() {
-			<-r.ctx.Done()
-			_ = lc.Shutdown() // запускаем остановку узлов при ещё живом engine
-			clientCancel()    // после остановки узлов — гасим движок
-			close(shutdownTriggered)
-		})
-
-		// Дожидаемся завершения clientCtx (engine). Это произойдёт либо после
-		// нашего clientCancel(), либо из-за внутренней ошибки движка.
-		<-ctx.Done()
-
-		// Если shutdown не был инициирован внешним контекстом (например, engine умер сам),
-		// корректно остановим узлы здесь.
-		select {
-		case <-shutdownTriggered:
-			// уже остановили выше
-		default:
-			_ = lc.Shutdown()
-		}
-		wg.Wait()
-
-		// Возвращаем ошибку контекста движка (для логов верхнего уровня).
-		return ctx.Err()
+		return r.runLifecycleLoop(ctx, lc, clientCancel)
 	})
+}
+
+func (r *Runner) loginSelf(ctx context.Context) (*tg.User, error) {
+	if err := r.cl.Login(ctx); err != nil {
+		return nil, err
+	}
+	self, err := r.cl.Client.Self(ctx)
+	if err != nil {
+		return nil, err
+	}
+	logger.Logger().Info("Logged in as:",
+		zap.String("FirstName", self.FirstName),
+		zap.String("Username", self.Username),
+		zap.Int64("ID", self.ID),
+	)
+	return self, nil
+}
+
+func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
+	if r.peers == nil {
+		return nil
+	}
+
+	if err := r.peers.Mgr.Init(ctx); err != nil {
+		logger.Errorf("failed to init peers manager: %v", err)
+		if config.Env().Notifier == notifierClient {
+			return err
+		}
+	}
+
+	if err := r.peers.WarmupIfEmpty(ctx, r.cl.API); err != nil {
+		logger.Errorf("failed to warm up peers manager: %v", err)
+		if config.Env().Notifier == notifierClient {
+			logger.Error("peers warmup error, cant use client notifier")
+			return err
+		}
+	}
+
+	logger.Debug("Peers warmup complete")
+	return nil
+}
+
+func (r *Runner) buildLifecycle(
+	ctx context.Context,
+	updmgr *tgupdates.Manager,
+	selfID int64,
+) (*lifecycle.Manager, error) {
+	lc := lifecycle.New(ctx)
+	if err := r.registerClientNodes(ctx, lc, updmgr, selfID); err != nil {
+		return nil, err
+	}
+	if err := lc.StartAll(); err != nil {
+		_ = lc.Shutdown()
+		return nil, err
+	}
+	return lc, nil
+}
+
+func (r *Runner) runLifecycleLoop(ctx context.Context, lc *lifecycle.Manager, clientCancel context.CancelFunc) error {
+	var wg sync.WaitGroup
+	shutdownTriggered := make(chan struct{})
+
+	wg.Go(func() {
+		<-r.ctx.Done()
+		_ = lc.Shutdown()
+		clientCancel()
+		close(shutdownTriggered)
+	})
+
+	<-ctx.Done()
+
+	select {
+	case <-shutdownTriggered:
+	default:
+		_ = lc.Shutdown()
+	}
+
+	wg.Wait()
+	return ctx.Err()
 }
 
 // handleUpdatesManagerStart вызывается updates.Manager при старте обработки апдейтов.

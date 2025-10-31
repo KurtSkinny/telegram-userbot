@@ -69,6 +69,9 @@ type ClientSender struct {
 // Параметр rps задаёт целевую среднюю частоту запросов. Подключён
 // FloodWaitExtractor для корректной паузы при FLOOD_WAIT/FLOOD_PREMIUM_WAIT.
 func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSender {
+	if peers == nil {
+		panic("ClientSender: peers manager must not be nil")
+	}
 	// Троттлер ограничивает RPS и умеет извлекать обязательные паузы из FLOOD_WAIT.
 	throttler := throttle.New(
 		rps,
@@ -127,15 +130,7 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	needForward := fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0
 
 	for idx, recipient := range job.Recipients {
-		var (
-			peer    tg.InputPeerClass
-			errPeer error
-		)
-		if s.peers == nil {
-			errPeer = errors.New("peers manager is not available")
-		} else {
-			peer, errPeer = s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
-		}
+		peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
 		if errPeer != nil {
 			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
@@ -275,15 +270,7 @@ func (s *ClientSender) apiForwardMessages(
 	toPeer tg.InputPeerClass,
 ) error {
 	fwd := job.Payload.Forward
-	var (
-		fromPeer tg.InputPeerClass
-		err      error
-	)
-	if s.peers == nil {
-		err = errors.New("peers manager is not available")
-	} else {
-		fromPeer, err = s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
-	}
+	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
 	if err != nil {
 		return &stopRetryError{
 			err:    fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err),
