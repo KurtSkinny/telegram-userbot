@@ -255,14 +255,7 @@ func (q *Queue) Close(ctx context.Context) error {
 // Notify формирует задание из результата фильтра и ставит его в очередь.
 // При флаге Forward добавляет спецификацию пересылки и, на всякий случай,
 // подготовленную копию текста (для транспорта без пересылки).
-func (q *Queue) Notify(
-	ctx context.Context, entities tg.Entities,
-	msg *tg.Message, fres filters.FilterMatchResult,
-) error {
-	// Очередь не использует контекст Notify: постановка в очередь не блокирует.
-	// Контекст нужен только для совместимости с прошлым интерфейсом.
-	_ = ctx // контекст используется для унификации интерфейса, очередь ставит задачу немедленно.
-
+func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.FilterMatchResult) error {
 	if msg == nil {
 		return errors.New("notifications queue: nil message")
 	}

@@ -192,7 +192,7 @@ func (h *Handlers) OnNewMessage(
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
 		}
-		if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+		if err := h.notif.Notify(entities, msg, res); err != nil {
 			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
 			logger.Errorf("notify enqueue error: %v", err)
 			continue
@@ -233,7 +233,7 @@ func (h *Handlers) OnNewChannelMessage(
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
 		}
-		if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+		if err := h.notif.Notify(entities, msg, res); err != nil {
 			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
 			logger.Errorf("notify enqueue error: %v", err)
 			continue
@@ -269,7 +269,7 @@ func (h *Handlers) OnEditMessage(
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue
 				}
-				if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+				if err := h.notif.Notify(entities, msg, res); err != nil {
 					logger.Errorf("notify enqueue error: %v", err)
 					continue
 				}
@@ -302,7 +302,7 @@ func (h *Handlers) OnEditChannelMessage(
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue
 				}
-				if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+				if err := h.notif.Notify(entities, msg, res); err != nil {
 					logger.Errorf("notify enqueue error: %v", err)
 					continue
 				}
