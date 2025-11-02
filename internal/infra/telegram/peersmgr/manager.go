@@ -180,6 +180,10 @@ func (s *Service) LoadFromStorage(ctx context.Context) error {
 	}
 
 	if err = iter.Err(); err != nil {
+		if isJSONUnmarshalError(err) {
+			_ = s.resetPeersBucket()
+			return nil
+		}
 		return fmt.Errorf("peersmgr: iterate stored peers: %w", err)
 	}
 	if len(users) == 0 && len(chats) == 0 {

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ type EnvConfig struct {
 	NotifyQueueFile   string
 	NotifyFailedFile  string
 	NotifyTimezone    string
+	AppTimezone       string
 	NotifySchedule    []string
 	NotifiedCacheFile string
 	NotifiedTTLDays   int
@@ -79,6 +81,7 @@ const (
 	defaultNotifyQueueFile   = "data/notify_queue.json"
 	defaultNotifyFailedFile  = "data/notify_failed.json"
 	defaultNotifyTimezone    = "Europe/Moscow"
+	defaultAppTimezone       = "UTC"
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
@@ -153,7 +156,8 @@ func loadConfig(envPath string) (*Config, error) {
 		defaultNotifyQueueFile, &warnings)
 	notifyFailedFile := sanitizeFile("NOTIFY_FAILED_FILE", os.Getenv("NOTIFY_FAILED_FILE"),
 		defaultNotifyFailedFile, &warnings)
-	notifyTimezone := sanitizeTimezone(os.Getenv("NOTIFY_TIMEZONE"), defaultNotifyTimezone, &warnings)
+	notifyTimezone := sanitizeTimezoneFlexible(os.Getenv("NOTIFY_TIMEZONE"), defaultNotifyTimezone, &warnings)
+	appTimezone := sanitizeTimezoneFlexible(os.Getenv("APP_TIMEZONE"), defaultAppTimezone, &warnings)
 	notifySchedule := sanitizeSchedule(os.Getenv("NOTIFY_SCHEDULE"), defaultNotifySchedule, &warnings)
 	notifiedCacheFile := sanitizeFile("NOTIFIED_CACHE_FILE", os.Getenv("NOTIFIED_CACHE_FILE"),
 		defaultNotifiedCacheFile, &warnings)
@@ -178,6 +182,7 @@ func loadConfig(envPath string) (*Config, error) {
 		NotifyQueueFile:   notifyQueueFile,
 		NotifyFailedFile:  notifyFailedFile,
 		NotifyTimezone:    notifyTimezone,
+		AppTimezone:       appTimezone,
 		NotifySchedule:    notifySchedule,
 		NotifiedCacheFile: notifiedCacheFile,
 		NotifiedTTLDays:   notifiedTTLDays,
@@ -307,20 +312,80 @@ func sanitizeFile(name, value, fallback string, warnings *[]string) string {
 	return v
 }
 
-// sanitizeTimezone проверяет корректность часовой зоны (через time.LoadLocation).
-// При ошибке подставляет fallback. Важно для корректного исполнения расписаний
-// уведомлений и интерпретации локального времени.
-func sanitizeTimezone(value string, fallback string, warnings *[]string) string {
-	tz := strings.TrimSpace(value)
-	if tz == "" {
-		appendWarningf(warnings, "env NOTIFY_TIMEZONE is not set; using default %q", fallback)
+// ParseLocation resolves either an IANA timezone (e.g., "Europe/Moscow") or a UTC offset
+// (e.g., "+03:00", "-0700", "UTC+3", "GMT-04:30"). Returns *time.Location or error.
+func ParseLocation(value string) (*time.Location, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, errors.New("empty timezone")
+	}
+	// Try IANA first.
+	if loc, err := time.LoadLocation(v); err == nil {
+		return loc, nil
+	}
+	// Try to parse UTC offset forms.
+	if loc, ok := parseUTCOffsetToLocation(v); ok {
+		return loc, nil
+	}
+	return nil, fmt.Errorf("invalid timezone %q: not an IANA name or UTC offset", value)
+}
+
+// sanitizeTimezoneFlexible validates that value is either a valid IANA zone or a UTC offset.
+// On failure, returns fallback and appends a warning.
+func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		appendWarningf(warnings, "env %s is not set; using default %q", "<timezone>", fallback)
 		return fallback
 	}
-	if _, err := time.LoadLocation(tz); err != nil {
-		appendWarningf(warnings, "env NOTIFY_TIMEZONE value %q is invalid; using default %q", tz, fallback)
+	if _, err := ParseLocation(v); err != nil {
+		appendWarningf(warnings, "timezone %q is invalid; using default %q", v, fallback)
 		return fallback
 	}
-	return tz
+	return v
+}
+
+// parseUTCOffsetToLocation parses strings like "+03:00", "-0700", "UTC+3", "GMT-04:30", or "Z".
+// Returns a fixed zone location and ok=true if parsed.
+func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
+	v := strings.TrimSpace(strings.ToUpper(value))
+	if v == "Z" || v == "UTC" || v == "GMT" {
+		return time.FixedZone("UTC+00:00", 0), true
+	}
+	// Normalize optional UTC/GMT prefix
+	v = strings.TrimPrefix(v, "UTC")
+	v = strings.TrimPrefix(v, "GMT")
+	v = strings.TrimSpace(v)
+	// Patterns: +HH, -HH, +HHMM, -HHMM, +HH:MM, -HH:MM
+	re := regexp.MustCompile(`^([+-])\s*(\d{1,2})(?::?(\d{2}))?$`)
+	m := re.FindStringSubmatch(v)
+	if m == nil {
+		return nil, false
+	}
+	sign := 1
+	if m[1] == "-" {
+		sign = -1
+	}
+	hourStr := m[2]
+	minStr := m[3]
+	hours, err := strconv.Atoi(hourStr)
+	if err != nil {
+		return nil, false
+	}
+	mins := 0
+	if minStr != "" {
+		var err2 error
+		mins, err2 = strconv.Atoi(minStr)
+		if err2 != nil {
+			return nil, false
+		}
+	}
+	if hours < 0 || hours > 14 || mins < 0 || mins > 59 {
+		return nil, false
+	}
+	offset := sign * ((hours * 60 * 60) + (mins * 60))
+	name := fmt.Sprintf("UTC%+03d:%02d", sign*hours, mins)
+	return time.FixedZone(name, offset), true
 }
 
 // sanitizeSchedule парсит CSV-строку формата "HH:MM,HH:MM,...", фильтрует

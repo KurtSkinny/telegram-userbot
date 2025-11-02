@@ -45,6 +45,14 @@ func main() {
 	if err := config.Load(*envPath); err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	// Apply application timezone (supports IANA and UTC offset). Affects time.Local globally.
+	if locApp, err := config.ParseLocation(config.Env().AppTimezone); err != nil {
+		log.Fatalf("failed to parse APP_TIMEZONE: %v", err)
+	} else {
+		time.Local = locApp //nolint:reassign // intentionally set application-wide timezone (app works in chosen TZ)
+		// Refresh bootstrap logger prefix to reflect chosen timezone.
+		log.SetPrefix(time.Now().Format("2006-01-02 15:04:05 "))
+	}
 
 	// logger.Init задаёт уровень, а SetWriters перенаправляет выводы в подсистему pr (чтобы видеть логи в CLI UI).
 	logger.Init(config.Env().LogLevel)

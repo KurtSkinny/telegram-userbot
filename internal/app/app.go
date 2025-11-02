@@ -162,7 +162,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	}
 
 	// Таймзона для расписания уведомлений берётся из конфигурации.
-	loc, err := time.LoadLocation(config.Env().NotifyTimezone)
+	loc, err := config.ParseLocation(config.Env().NotifyTimezone)
 	if err != nil {
 		return fmt.Errorf("load notify timezone: %w", err)
 	}
