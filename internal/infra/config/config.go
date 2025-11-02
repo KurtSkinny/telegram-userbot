@@ -312,8 +312,9 @@ func sanitizeFile(name, value, fallback string, warnings *[]string) string {
 	return v
 }
 
-// ParseLocation resolves either an IANA timezone (e.g., "Europe/Moscow") or a UTC offset
-// (e.g., "+03:00", "-0700", "UTC+3", "GMT-04:30"). Returns *time.Location or error.
+// ParseLocation разбирает либо IANA‑таймзону (например, "Europe/Moscow"),
+// либо UTC‑смещение (например, "+03:00", "-0700", "UTC+3", "GMT-04:30").
+// Возвращает *time.Location или ошибку.
 func ParseLocation(value string) (*time.Location, error) {
 	v := strings.TrimSpace(value)
 	if v == "" {
@@ -330,8 +331,8 @@ func ParseLocation(value string) (*time.Location, error) {
 	return nil, fmt.Errorf("invalid timezone %q: not an IANA name or UTC offset", value)
 }
 
-// sanitizeTimezoneFlexible validates that value is either a valid IANA zone or a UTC offset.
-// On failure, returns fallback and appends a warning.
+// sanitizeTimezoneFlexible проверяет, что значение — корректная IANA‑зона или UTC‑смещение.
+// При неудаче возвращает значение по умолчанию и добавляет предупреждение.
 func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string) string {
 	v := strings.TrimSpace(value)
 	if v == "" {
@@ -345,8 +346,8 @@ func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string)
 	return v
 }
 
-// parseUTCOffsetToLocation parses strings like "+03:00", "-0700", "UTC+3", "GMT-04:30", or "Z".
-// Returns a fixed zone location and ok=true if parsed.
+// parseUTCOffsetToLocation парсит строки вида "+03:00", "-0700", "UTC+3", "GMT-04:30" или "Z".
+// Возвращает фиксированную таймзону и ok=true при успешном разборе.
 func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
 	v := strings.TrimSpace(strings.ToUpper(value))
 	if v == "Z" || v == "UTC" || v == "GMT" {
