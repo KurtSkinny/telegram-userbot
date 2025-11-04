@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"telegram-userbot/internal/domain/recipients"
+	"telegram-userbot/internal/infra/logger"
 )
 
 // Match описывает правила совпадения входящих сообщений. Движок фильтрации
@@ -33,9 +34,9 @@ type Match struct {
 //
 // Конкретная реализация уведомителя (client/bot) определяется через EnvConfig.
 type NotifyConfig struct {
-	Recipients recipients.RecipientTargets `json:"recipients"`
-	Forward    bool                        `json:"forward"`
-	Template   string                      `json:"template"`
+	Recipients []string `json:"recipients"`  // ИЗМЕНЕНО: было RecipientTargets, стало []string
+	Forward    bool     `json:"forward"`
+	Template   string   `json:"template"`
 }
 
 // Filter описывает законченное правило обработки:
@@ -66,12 +67,14 @@ type FilterEngine struct {
 	filtersPath string
 	filters     []Filter
 	uniqueChats []int64
+	recipients  *recipients.RecipientManager  // НОВОЕ
 	mu          sync.RWMutex
 }
 
-func NewFilterEngine(filtersPath string) *FilterEngine {
+func NewFilterEngine(filtersPath string, recipientsMgr *recipients.RecipientManager) *FilterEngine {
 	return &FilterEngine{
 		filtersPath: filtersPath,
+		recipients:  recipientsMgr,
 	}
 }
 
@@ -99,9 +102,24 @@ func (fe *FilterEngine) Load() error {
 		chats = append(chats, chat)
 	}
 
+	// НОВАЯ ЛОГИКА: проверяем каждый фильтр на валидность получателей
+	var validFilters []Filter
+	for _, filter := range filtersConfig.Filters {
+		if len(filter.Notify.Recipients) == 0 {
+			// Пропускаем фильтр без получателей
+			logger.Errorf("Filter '%s' has empty recipients list, skipping", filter.ID)
+		} else if err := fe.recipients.ValidateIDs(filter.Notify.Recipients); err != nil {
+			// Пропускаем фильтр с невалидными ID получателей
+			logger.Errorf("Filter '%s' has invalid recipients: %v, skipping", filter.ID, err)
+		} else {
+			// Фильтр валиден, добавляем его
+			validFilters = append(validFilters, filter)
+		}
+	}
+
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
-	fe.filters = filtersConfig.Filters
+	fe.filters = validFilters
 	fe.uniqueChats = chats
 
 	return nil

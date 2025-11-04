@@ -16,6 +16,7 @@ import (
 	"telegram-userbot/internal/adapters/telegram/core"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
+	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
@@ -56,15 +57,16 @@ var (
 // и синхронно закрывается через Stop(). Потокобезопасность обеспечивается
 // дисциплиной запуска/остановки и отсутствием внешних мутаций.
 type Service struct {
-	cl        *core.ClientCore      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
-	stopApp   context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
-	filters   *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
-	notif     *notifications.Queue  // очередь уведомлений; нужна для flush/status
-	peers     *peersmgr.Service     // peers-кэш, предоставляет офлайн-данные по диалогам
-	cancel    context.CancelFunc    // локальная отмена run-цикла CLI
-	wg        sync.WaitGroup        // ожидание завершения фоновой горутины run
-	onceStart sync.Once             // идемпотентный запуск
-	onceStop  sync.Once             // идемпотентная остановка
+	cl         *core.ClientCore           // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
+	stopApp    context.CancelFunc         // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
+	filters    *filters.FilterEngine      // Движок фильтров: загрузка, хранение, матчи.
+	notif      *notifications.Queue       // очередь уведомлений; нужна для flush/status
+	peers      *peersmgr.Service          // peers-кэш, предоставляет офлайн-данные по диалогам
+	recipients *recipients.RecipientManager  // НОВОЕ
+	cancel     context.CancelFunc         // локальная отмена run-цикла CLI
+	wg         sync.WaitGroup             // ожидание завершения фоновой горутины run
+	onceStart  sync.Once                  // идемпотентный запуск
+	onceStop   sync.Once                  // идемпотентная остановка
 }
 
 const refreshDialogsTimeout = 30 * time.Second
@@ -78,8 +80,16 @@ func NewService(
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
+	recipientsMgr *recipients.RecipientManager,  // НОВОЕ
 ) *Service {
-	return &Service{cl: cl, stopApp: stopApp, filters: filterEngine, notif: notif, peers: peers}
+	return &Service{
+		cl:         cl,
+		stopApp:    stopApp,
+		filters:    filterEngine,
+		notif:      notif,
+		peers:      peers,
+		recipients: recipientsMgr,  // НОВОЕ
+	}
 }
 
 // Start запускает основной цикл CLI в отдельной горутине. Повторные вызовы
@@ -212,11 +222,17 @@ func (s *Service) handleCommand(cmd string) bool {
 	case "refresh dialogs":
 		s.handleRefreshDialogs()
 	case "reload":
-		if err := s.filters.Load(); err != nil {
-			pr.ErrPrintln("reload error:", err)
-		} else {
-			pr.Println("filters.json reloaded")
+		// Сначала перезагружаем recipients
+		if err := s.recipients.Load(); err != nil {
+			pr.ErrPrintln("reload recipients error:", err)
+			return false
 		}
+		// Затем перезагружаем filters (они валидируются по recipients)
+		if err := s.filters.Load(); err != nil {
+			pr.ErrPrintln("reload filters error:", err)
+			return false
+		}
+		pr.Println("recipients.json and filters.json reloaded")
 	case "whoami":
 		if res, err := whoAmI(s.cl); err != nil {
 			pr.ErrPrintln("whoami error:", err)

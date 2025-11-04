@@ -68,6 +68,7 @@ cp assets/.env.example assets/.env
 | `NOTIFIED_CACHE_TTL_DAYS` | TTL кэша уведомлений | `30` |
 | `NOTIFY_TIMEZONE` | часовой пояс расписания | `Europe/Moscow` |
 | `NOTIFY_SCHEDULE` | расписание уведомлений, формат `HH:MM[,HH:MM...]` | `08:00,17:00` |
+| `RECIPIENTS_FILE` | файл с определениями получателей | `assets/recipients.json` |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `debug` |
 | `TEST_DC` | `true` для тестового DC (MTProto и Bot API) | `false` |
 | `ADMIN_UID` | UID администратора для сервисных уведомлений и для команды `test` | `0` |
@@ -76,7 +77,45 @@ cp assets/.env.example assets/.env
 
 Приоритет настроек: **CLI‑флаги > переменные окружения > значения по умолчанию**.
 
-### 4) Описать правила (`filters.json`)
+### 4) Описать получателей (`recipients.json`)
+
+Создайте файл с определением получателей:
+
+```bash
+cp assets/recipients.json.example assets/recipients.json
+```
+
+**Расположение:** `assets/recipients.json` (настраивается через переменную окружения `RECIPIENTS_FILE`)
+
+**Формат:**
+- `recipients` - мапа определений получателей, ключ - уникальный ID получателя
+  - `kind` - тип получателя: `user`, `chat`, или `channel` (по умолчанию: `user`)
+  - `peer_id` - **обязательное поле**, Telegram peer ID
+  - `note` - опциональное описание или отображаемое имя
+  - `tz` - опциональная временная зона (IANA имя или UTC смещение в формате "+03:00")
+  - `schedule` - опциональное расписание доставки в формате массива "HH:MM"
+
+**Пример:**
+```json
+{
+  "recipients": {
+    "admin_main": {
+      "kind": "user",
+      "peer_id": 5002402758,
+      "note": "Main administrator",
+      "tz": "Europe/Moscow",
+      "schedule": ["09:00", "18:00"]
+    },
+    "chat_team": {
+      "kind": "chat",
+      "peer_id": 45678902232,
+      "note": "Team chat"
+    }
+  }
+}
+```
+
+### 5) Описать правила (`filters.json`)
 
 Скопируйте пример:
 
@@ -101,11 +140,7 @@ cp assets/filters.json.example assets/filters.json
       },
       "urgent": true,
       "notify": {
-        "recipients": {
-          "users":   [111111111],
-          "chats":   [2222222222],
-          "channels":[3333333333]
-        },
+        "recipients": ["admin_main", "chat_team"],
         "forward": false,
         "template": "Искомые слова: {{keywords}}\\nregex: {{regex}}\\nСсылка: {{message_link}}"
       }
@@ -123,8 +158,12 @@ cp assets/filters.json.example assets/filters.json
   - `regex` — регулярное выражение по тексту сообщения; для регистронезависимости используйте префикс `(?i)`;
   - исключения `exclude_any` и `exclude_regex` имеют приоритет: одно срабатывание отклоняет сообщение.
 - `urgent` — при значении `true` уведомление минует расписание и отправляется сразу; иначе попадает в очередь и уйдет в ближайшее окно из `NOTIFY_SCHEDULE`.
-- `notify.recipients` — поддерживаются `users`, `chats`, `channels`. Короткая форма `recipients: [uid, ...]` допустима для списка пользователей.
+- `notify.recipients` — массив строк ID получателей из `recipients.json`. Все указанные ID должны существовать в `recipients.json`.
 - `template` — строка с плейсхолдерами (см. ниже).
+
+**Изменения по сравнению с предыдущей версией:**
+- `notify.recipients` теперь массив строк ID получателей (вместо inline peer списков)
+- Получатели должны быть определены в `recipients.json` сначала
 
 Подстановки в шаблоне: `{{keywords}}`, `{{regex}}`, `{{message_link}}`. Ссылки строятся как `https://t.me/<username>/<message_id>` при наличии username; иначе формируется `tg://` ссылка.
 
