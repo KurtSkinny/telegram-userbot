@@ -39,15 +39,15 @@ import (
 //   - корректное завершение: сначала останавливаются узлы (статусы/очереди), затем гасится MTProto‑движок,
 //   - интеграцию с CLI и доменными обработчиками обновлений.
 type Runner struct {
-	cl         *core.ClientCore           // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
-	filters    *filters.FilterEngine      // Движок фильтров: загрузка, хранение, матчи.
-	notif      *notifications.Queue       // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
-	dedup      *concurrency.Deduplicator  // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
-	deb        *concurrency.Debouncer     // Сглаживание/слияние частых событий (например, всплесков апдейтов).
-	h          *domainupdates.Handlers    // Композиция доменных обработчиков апдейтов Telegram.
-	ctx        context.Context            // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
-	stop       context.CancelFunc         // Функция, инициирующая общий shutdown (используется из узлов).
-	peers      *peersmgr.Service          // Сервис пиров (peers.Manager + persist storage).
+	cl         *core.ClientCore             // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
+	filters    *filters.FilterEngine        // Движок фильтров: загрузка, хранение, матчи.
+	notif      *notifications.Queue         // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
+	dedup      *concurrency.Deduplicator    // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
+	deb        *concurrency.Debouncer       // Сглаживание/слияние частых событий (например, всплесков апдейтов).
+	h          *domainupdates.Handlers      // Композиция доменных обработчиков апдейтов Telegram.
+	ctx        context.Context              // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
+	stop       context.CancelFunc           // Функция, инициирующая общий shutdown (используется из узлов).
+	peers      *peersmgr.Service            // Сервис пиров (peers.Manager + persist storage).
 	recipients *recipients.RecipientManager // Менеджер получателей (для CLI)
 }
 
@@ -404,7 +404,7 @@ func (r *Runner) registerClientNodes(
 
 	// Узел: cli
 	// Сервис интерактивных команд. Не блокирует основную петлю, но может инициировать shutdown через r.stop().
-	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif, r.peers, r.recipients)
+	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif, r.peers)
 	if err := lc.Register(
 		"cli",
 		"",

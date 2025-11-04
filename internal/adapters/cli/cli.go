@@ -16,7 +16,6 @@ import (
 	"telegram-userbot/internal/adapters/telegram/core"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
-	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
@@ -79,7 +78,6 @@ func NewService(
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
-	recipientsMgr *recipients.RecipientManager,
 ) *Service {
 	return &Service{
 		cl:      cl,
