@@ -325,8 +325,7 @@ func (s *Service) handleTest() {
 	recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
 	// Простейший уникальный ID «задания» — текущее время в наносекундах. Достаточно для CLI.
 	jobID := time.Now().UnixNano() // используем текущее время как уникальный идентификатор "задания"
-	const firstRecipientIndex = 0  // индекс получателя в рамках задания (избегаем magic number)
-	randomID := notifications.RandomIDForMessage(jobID, recipient, firstRecipientIndex)
+	randomID := notifications.RandomIDForMessage(jobID, recipient)
 
 	// Готовим запрос отправки сообщения. Текст простой, без entities.
 	req := &tg.MessagesSendMessageRequest{

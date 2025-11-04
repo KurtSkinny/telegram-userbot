@@ -43,15 +43,15 @@ type Payload struct {
 	Copy    *CopyText    `json:"copy,omitempty"`
 }
 
-// Job — единица работы очереди уведомлений. Один job может адресоваться нескольким получателям.
+// Job — единица работы очереди уведомлений. Один job адресуется одному получателю.
 // Идентификатор ID монотонно растёт и используется, среди прочего, для детерминированного random_id.
 // Порядок доставки получателям — FIFO.
 type Job struct {
-	ID         int64       `json:"id"`
-	CreatedAt  time.Time   `json:"created_at"`
-	Urgent     bool        `json:"urgent"`
-	Recipients []Recipient `json:"recipients"`
-	Payload    Payload     `json:"payload"`
+	ID         int64     `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	Urgent     bool      `json:"urgent"`
+	Recipient  Recipient `json:"recipient"`
+	Payload    Payload   `json:"payload"`
 }
 
 // State — сериализуемый снимок очереди: бэклоги urgent/regular, счётчик NextID и метки времени.
@@ -65,13 +65,12 @@ type State struct {
 	Urgent             []Job     `json:"urgent"`
 }
 
-// FailedRecord фиксирует окончательно провалившуюся доставку: полный снимок job,
-// конкретных недоставленных получателей и текст агрегированной ошибки.
+// FailedRecord фиксирует окончательно провалившуюся доставку: полный снимок job
+// и текст агрегированной ошибки.
 type FailedRecord struct {
-	Job        Job         `json:"job"`
-	FailedAt   time.Time   `json:"failed_at"`
-	Error      string      `json:"error"`
-	Recipients []Recipient `json:"recipients"`
+	Job      Job       `json:"job"`
+	FailedAt time.Time `json:"failed_at"`
+	Error    string    `json:"error"`
 }
 
 // DefaultState создаёт начальное состояние очереди: NextID=1, пустые бэклоги, нулевые метки времени.
@@ -84,7 +83,6 @@ func DefaultState() State {
 // Clone делает глубокую копию Job, чтобы дальнейшие изменения исходника не затронули персист/бэклоги.
 func (j Job) Clone() Job {
 	clone := j
-	clone.Recipients = cloneRecipients(j.Recipients)
 	clone.Payload = clonePayload(j.Payload)
 	return clone
 }
@@ -97,11 +95,10 @@ func (s State) Clone() State {
 	return clone
 }
 
-// Clone возвращает независимую копию записи о провале, включая вложенный Job и список получателей.
+// Clone возвращает независимую копию записи о провале, включая вложенный Job.
 func (r FailedRecord) Clone() FailedRecord {
 	clone := r
 	clone.Job = r.Job.Clone()
-	clone.Recipients = cloneRecipients(r.Recipients)
 	return clone
 }
 

@@ -113,14 +113,14 @@ func (s *ClientSender) BeforeDrain(ctx context.Context) {
 	telegramruntime.WaitRandomTime(ctx)
 }
 
-// Deliver выполняет одно задание: для каждого получателя по FIFO:
+// Deliver выполняет одно задание: для получателя в job:
 //  1. резолвит peer через локальный кэш;
 //  2. ждёт онлайна и имитирует набор текста;
 //  3. отправляет текст; при необходимости — пересылает оригиналы;
 //  4. классифицирует ошибки: permanent → пропуск адресата, network → выход,
 //     прочие → возврат с флагом Retry.
 //
-// Возвращает агрегированный SendOutcome и ошибку, если требуется прерывание дренирования.
+// Возвращает SendOutcome и ошибку, если требуется прерывание дренирования.
 func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (notifications.SendOutcome, error) {
 	var outcome notifications.SendOutcome
 
@@ -129,44 +129,43 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	fwd := job.Payload.Forward
 	needForward := fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0
 
-	for idx, recipient := range job.Recipients {
-		peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
-		if errPeer != nil {
-			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
-			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-			outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
-			continue
+	recipient := job.Recipient
+	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
+	if errPeer != nil {
+		logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
+		outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+		outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
+		return outcome, nil
+	}
+
+	// Убеждаемся, что соединение живо, и показываем «typing».
+	connection.WaitOnline(ctx)
+	status.DoTypingWaitChars(ctx, peer, job.Payload.Text)
+
+	if hasText {
+		skip, retErr := s.handleAPIErr(
+			s.apiSendMessage(ctx, job, recipient, 0, peer),
+			recipient, &outcome,
+		)
+		if skip {
+			return outcome, nil
 		}
-
-		// Перед каждым адресатом убеждаемся, что соединение живо, и показываем «typing».
-		connection.WaitOnline(ctx)
-		status.DoTypingWaitChars(ctx, peer, job.Payload.Text)
-
-		if hasText {
-			skip, retErr := s.handleAPIErr(
-				s.apiSendMessage(ctx, job, recipient, idx, peer),
-				recipient, &outcome,
-			)
-			if skip {
-				continue
-			}
-			if retErr != nil {
-				return outcome, retErr
-			}
+		if retErr != nil {
+			return outcome, retErr
 		}
+	}
 
-		if needForward {
-			skip, retErr := s.handleAPIErr(
-				s.apiForwardMessages(ctx, job, recipient, peer),
-				recipient, &outcome,
-			)
+	if needForward {
+		skip, retErr := s.handleAPIErr(
+			s.apiForwardMessages(ctx, job, recipient, peer),
+			recipient, &outcome,
+		)
 
-			if skip {
-				continue
-			}
-			if retErr != nil {
-				return outcome, retErr
-			}
+		if skip {
+			return outcome, nil
+		}
+		if retErr != nil {
+			return outcome, retErr
 		}
 	}
 
@@ -219,8 +218,8 @@ func (s *ClientSender) apiSendMessage(
 	index int,
 	peer tg.InputPeerClass,
 ) error {
-	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient,index).
-	randomID := notifications.RandomIDForMessage(job.ID, recipient, index)
+	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient).
+	randomID := notifications.RandomIDForMessage(job.ID, recipient)
 
 	req := &tg.MessagesSendMessageRequest{
 		Peer:     peer,

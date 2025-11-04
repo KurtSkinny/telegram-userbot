@@ -116,7 +116,7 @@ func toBotChatID(r notifications.Recipient) int64 {
 	}
 }
 
-// Deliver последовательно отправляет уведомления каждому получателю (FIFO).
+// Deliver отправляет уведомление одному получателю (job.Recipient).
 // Если в payload включён Forward и подготовлена копия исходного сообщения (text+entities),
 // бот отправляет ДВА сообщения: (1) обычный текст уведомления и (2) копию исходного текста
 // с entities (не форвард). Такая последовательность совпадает с бизнес‑логикой клиента.
@@ -132,38 +132,35 @@ func (s *BotSender) Deliver(ctx context.Context, job notifications.Job) (notific
 		job.Payload.Copy != nil &&
 		strings.TrimSpace(job.Payload.Copy.Text) != ""
 
-	// Идём по получателям в порядке очереди. Ошибки 4xx фиксируем и продолжаем, временные — прерываем на ретрай.
-	for _, recipient := range job.Recipients {
-		// 1) Сначала отправляем обычный текст уведомления, если он есть.
-		if hasText {
-			chatID := toBotChatID(recipient)
-			permanent, err := s.sendMessage(ctx, chatID, job.Payload.Text)
-			if err != nil {
-				if permanent {
-					outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-					outcome.PermanentError = errors.Join(outcome.PermanentError, err)
-					// Текст не доставлен этому получателю — переходим к следующему.
-					continue
-				}
-				// Временная ошибка — прерываем обработку всего job на ретрай.
-				outcome.Retry = true
-				return outcome, err
+	recipient := job.Recipient
+	// 1) Сначала отправляем обычный текст уведомления, если он есть.
+	if hasText {
+		chatID := toBotChatID(recipient)
+		permanent, err := s.sendMessage(ctx, chatID, job.Payload.Text)
+		if err != nil {
+			if permanent {
+				outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+				outcome.PermanentError = errors.Join(outcome.PermanentError, err)
+				return outcome, nil
 			}
+			// Временная ошибка — прерываем обработку всего job на ретрай.
+			outcome.Retry = true
+			return outcome, err
 		}
+	}
 
-		// 2) Затем, если включён forward и подготовлена копия — отправляем копию исходного сообщения.
-		if hasCopy {
-			chatID := toBotChatID(recipient)
-			permanent, err := s.sendMessageRich(ctx, chatID, job.Payload.Copy.Text, job.Payload.Copy.Entities)
-			if err != nil {
-				if permanent {
-					outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-					outcome.PermanentError = errors.Join(outcome.PermanentError, err)
-					continue
-				}
-				outcome.Retry = true
-				return outcome, err
+	// 2) Затем, если включён forward и подготовлена копия — отправляем копию исходного сообщения.
+	if hasCopy {
+		chatID := toBotChatID(recipient)
+		permanent, err := s.sendMessageRich(ctx, chatID, job.Payload.Copy.Text, job.Payload.Copy.Entities)
+		if err != nil {
+			if permanent {
+				outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+				outcome.PermanentError = errors.Join(outcome.PermanentError, err)
+				return outcome, nil
 			}
+			outcome.Retry = true
+			return outcome, err
 		}
 	}
 
