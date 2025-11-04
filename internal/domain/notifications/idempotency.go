@@ -17,15 +17,14 @@ const (
 )
 
 // RandomIDForMessage генерирует детерминированный random_id для одиночного текстового отправления.
-// Вход включает jobID, тип/ID получателя и порядковый индекс получателя в job.
+// Вход включает jobID и тип/ID получателя.
 // Это гарантирует устойчивость к ретраям и отсутствие дублей в пределах адресата.
-// Важно: уникальность обеспечивается на уровне комбинации (jobID, recipient, index).
-func RandomIDForMessage(jobID int64, recipient Recipient, index int) int64 {
+// Важно: уникальность обеспечивается на уровне комбинации (jobID, recipient).
+func RandomIDForMessage(jobID int64, recipient Recipient) int64 {
 	return randomIDFromParts(
 		uint64(jobID), // #nosec G115
 		recipientTypeKey(recipient.Type),
 		uint64(recipient.ID), // #nosec G115
-		uint64(index),        // #nosec G115
 	)
 }
 

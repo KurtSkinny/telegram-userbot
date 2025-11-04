@@ -212,7 +212,7 @@ func (s *Service) handleCommand(cmd string) bool {
 	case "refresh dialogs":
 		s.handleRefreshDialogs()
 	case "reload":
-		if err := s.filters.GetFilters(); err != nil {
+		if err := s.filters.Load(); err != nil {
 			pr.ErrPrintln("reload error:", err)
 		} else {
 			pr.Println("filters.json reloaded")
@@ -325,8 +325,7 @@ func (s *Service) handleTest() {
 	recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
 	// Простейший уникальный ID «задания» — текущее время в наносекундах. Достаточно для CLI.
 	jobID := time.Now().UnixNano() // используем текущее время как уникальный идентификатор "задания"
-	const firstRecipientIndex = 0  // индекс получателя в рамках задания (избегаем magic number)
-	randomID := notifications.RandomIDForMessage(jobID, recipient, firstRecipientIndex)
+	randomID := notifications.RandomIDForMessage(jobID, recipient)
 
 	// Готовим запрос отправки сообщения. Текст простой, без entities.
 	req := &tg.MessagesSendMessageRequest{

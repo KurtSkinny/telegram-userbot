@@ -252,43 +252,42 @@ func (q *Queue) Close(ctx context.Context) error {
 	return nil
 }
 
-// Notify формирует задание из результата фильтра и ставит его в очередь.
+// Notify формирует задания из результата фильтра и ставит их в очередь.
 // При флаге Forward добавляет спецификацию пересылки и, на всякий случай,
 // подготовленную копию текста (для транспорта без пересылки).
 func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.FilterMatchResult) error {
 	if msg == nil {
 		return errors.New("notifications queue: nil message")
 	}
-	recipients := buildRecipientsFromTargets(fres.Filter.Notify.Recipients)
-	if len(recipients) == 0 {
-		return errors.New("notifications queue: empty recipients list")
-	}
 
 	link := BuildMessageLink(q.peers, entities, msg)
 	text := RenderTemplate(fres.Filter.Notify.Template, fres.Result, link)
 
-	job := Job{
-		Urgent:     fres.Filter.Urgent,
-		Recipients: recipients,
-		Payload: Payload{
-			Text: strings.TrimSpace(text),
-		},
+	payload := Payload{
+		Text: strings.TrimSpace(text),
 	}
 
 	if fres.Filter.Notify.Forward {
 		if fwd, err := buildForwardSpec(msg); err != nil {
 			logger.Errorf("Queue: forward spec error for message %d: %v", msg.ID, err)
 		} else {
-			job.Payload.Forward = fwd
+			payload.Forward = fwd
 		}
 		// Если требуется «форвард», а бот не умеет пересылать — подготовим копию текста для Bot API.
-		job.Payload.Copy = BuildCopyTextFromTG(msg)
+		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	jobID := q.enqueue(job)
-	logger.Debugf(
-		"Queue: job %d enqueued (filter=%s urgent=%t recipients=%d)",
-		jobID, fres.Filter.ID, job.Urgent, len(job.Recipients))
+	jobs := buildJobsFromTargets(fres.Filter.Notify.Recipients, fres.Filter.Urgent, payload)
+	if len(jobs) == 0 {
+		return errors.New("notifications queue: empty recipients list")
+	}
+
+	for _, job := range jobs {
+		jobID := q.enqueue(job)
+		logger.Debugf(
+			"Queue: job %d enqueued (filter=%s urgent=%t recipient=%s:%d)",
+			jobID, fres.Filter.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
+	}
 
 	return nil
 }
@@ -301,11 +300,9 @@ func (q *Queue) Send(ctx context.Context, uid int64, text string) error {
 
 	job := Job{
 		Urgent: true,
-		Recipients: []Recipient{
-			{
-				Type: RecipientTypeUser,
-				ID:   uid,
-			},
+		Recipient: Recipient{
+			Type: RecipientTypeUser,
+			ID:   uid,
 		},
 		Payload: Payload{
 			Text: strings.TrimSpace(text),
@@ -546,7 +543,7 @@ func (q *Queue) processRegular(sig drainSignal) {
 // Возвращает true, если задание было возвращено в очередь или потребовалось ждать online/ctx.
 func (q *Queue) handleJob(job Job) bool {
 	start := q.now()
-	logger.Debugf("Queue: delivering job %d (urgent=%t recipients=%d)", job.ID, job.Urgent, len(job.Recipients))
+	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)", job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
 
 	ctx := q.ctx
 	result, err := q.sender.Deliver(ctx, job)
@@ -587,17 +584,16 @@ func (q *Queue) handleJob(job Job) bool {
 			errMsg = result.PermanentError.Error()
 		}
 		record := FailedRecord{
-			Job:        job.Clone(),
-			FailedAt:   q.now().UTC(),
-			Error:      errMsg,
-			Recipients: cloneRecipients(result.PermanentFailures),
+			Job:      job.Clone(),
+			FailedAt: q.now().UTC(),
+			Error:    errMsg,
 		}
 		if appendErr := q.failed.Append(record); appendErr != nil {
 			logger.Errorf("Queue: failed store append error: %v", appendErr)
 		}
 		logger.Errorf(
-			"Queue: job %d permanent failure for %d recipient(s): %s",
-			job.ID, len(result.PermanentFailures), errMsg)
+			"Queue: job %d permanent failure for recipient %s:%d: %s",
+			job.ID, job.Recipient.Type, job.Recipient.ID, errMsg)
 	}
 
 	duration := time.Since(start)
@@ -734,10 +730,13 @@ func (q *Queue) previousScheduleAt(now time.Time) time.Time {
 	return prev.UTC()
 }
 
-// buildRecipientsFromTargets собирает получателей из users/chats/channels и устраняет дубликаты по (Type, ID).
-func buildRecipientsFromTargets(t recipients.RecipientTargets) []Recipient {
+// buildJobsFromTargets создает список Job из targets, по одной на каждого получателя.
+func buildJobsFromTargets(t recipients.RecipientTargets, urgent bool, payload Payload) []Job {
 	total := len(t.Users) + len(t.Chats) + len(t.Channels)
-	out := make([]Recipient, 0, total)
+	if total == 0 {
+		return nil
+	}
+	out := make([]Job, 0, total)
 	seen := make(map[string]struct{}, total)
 
 	add := func(kind string, ids []int64) {
@@ -750,7 +749,12 @@ func buildRecipientsFromTargets(t recipients.RecipientTargets) []Recipient {
 				continue
 			}
 			seen[key] = struct{}{}
-			out = append(out, Recipient{Type: kind, ID: id})
+			job := Job{
+				Urgent:    urgent,
+				Recipient: Recipient{Type: kind, ID: id},
+				Payload:   payload,
+			}
+			out = append(out, job)
 		}
 	}
 
