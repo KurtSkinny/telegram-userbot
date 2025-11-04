@@ -56,7 +56,7 @@ type EnvConfig struct {
 	NotifiedTTLDays   int
 	FiltersFile       string
 	PeersCacheFile    string
-	RecipientsFile    string  // НОВОЕ
+	RecipientsFile    string // НОВОЕ
 }
 
 // Config хранит конфигурацию среды.
@@ -86,12 +86,11 @@ const (
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
+	defaultRecipientsFile    = "assets/recipients.json"
 	defaultPeersCacheFile    = "data/peers_cache.bbolt"
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
-
-const defaultRecipientsFile = "assets/recipients.json"
 
 var (
 	cfgInstance *Config
@@ -192,8 +191,8 @@ func loadConfig(envPath string) (*Config, error) {
 		NotifiedCacheFile: notifiedCacheFile,
 		NotifiedTTLDays:   notifiedTTLDays,
 		FiltersFile:       filtersFile,
+		RecipientsFile:    recipientsFile,
 		PeersCacheFile:    peersCacheFile,
-		RecipientsFile:    recipientsFile,  // НОВОЕ
 	}
 
 	cfg := &Config{

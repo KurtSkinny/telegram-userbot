@@ -20,7 +20,7 @@ import (
 // Recipient — полное описание получателя из recipients.json
 type Recipient struct {
 	ID       string   `json:"-"`    // ключ из JSON (заполняется при парсинге)
-	Kind     string   `json:"kind"` // user|chat|channel
+	Type     string   `json:"type"` // user|chat|channel
 	PeerID   int64    `json:"peer_id"`
 	Note     string   `json:"note"`
 	TZ       string   `json:"tz"`
@@ -88,7 +88,7 @@ func (rm *RecipientManager) ResolveToTargets(ids []string) []ResolvedRecipient {
 	for _, id := range ids {
 		if r, ok := rm.recipients[id]; ok {
 			result = append(result, ResolvedRecipient{
-				Kind:   r.Kind,
+				Kind:   r.Type,
 				PeerID: r.PeerID,
 			})
 		} else {
@@ -148,13 +148,13 @@ func (rm *RecipientManager) Load() error {
 		}
 
 		// Устанавливаем kind по умолчанию, если пустой
-		if recipient.Kind == "" {
-			recipient.Kind = "user"
+		if recipient.Type == "" {
+			recipient.Type = "user"
 		}
 
 		// Проверяем, что kind допустим
-		if recipient.Kind != "user" && recipient.Kind != "chat" && recipient.Kind != "channel" {
-			logger.Errorf("Recipient '%s' has invalid kind: '%s', skipping", id, recipient.Kind)
+		if recipient.Type != "user" && recipient.Type != "chat" && recipient.Type != "channel" {
+			logger.Errorf("Recipient '%s' has invalid kind: '%s', skipping", id, recipient.Type)
 			continue
 		}
 
@@ -180,7 +180,7 @@ func (rm *RecipientManager) Load() error {
 		}
 
 		// Проверка дубликатов по kind+peer_id
-		kindPeerKey := recipient.Kind + ":" + strconv.FormatInt(recipient.PeerID, 10)
+		kindPeerKey := recipient.Type + ":" + strconv.FormatInt(recipient.PeerID, 10)
 		if existingIDs, exists := kindPeerMap[kindPeerKey]; exists {
 			logger.Warnf("Recipient '%s' has same kind:peer_id ('%s') as existing recipient(s): %v", id, kindPeerKey, existingIDs)
 		} else {

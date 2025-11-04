@@ -1,7 +1,7 @@
 {
   "recipients": {
     "admin_main": {
-      "kind": "user",
+      "type": "user",
       "peer_id": 5002402758,
       "note": "Main administrator",
       "tz": "Europe/Moscow",
@@ -14,12 +14,12 @@
       "schedule": ["08:00", "20:00"]
     },
     "chat_team": {
-      "kind": "chat",
+      "type": "chat",
       "peer_id": 45678902232,
       "note": "Team chat"
     },
     "channel_announcements": {
-      "kind": "channel",
+      "type": "channel",
       "peer_id": 1234567890,
       "note": "Public announcements",
       "tz": "UTC",

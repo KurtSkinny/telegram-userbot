@@ -63,7 +63,7 @@ type QueueOptions struct {
 	Location      *time.Location
 	Clock         func() time.Time
 	Peers         *peersmgr.Service
-	RecipientsMgr *recipients.RecipientManager  // НОВОЕ
+	RecipientsMgr *recipients.RecipientManager // НОВОЕ
 }
 
 // scheduleEntry — нормализованный слот расписания в локальной таймзоне.
@@ -105,7 +105,7 @@ type Queue struct {
 	location      *time.Location
 	schedule      []scheduleEntry
 	peers         *peersmgr.Service
-	recipientsMgr *recipients.RecipientManager  // НОВОЕ
+	recipientsMgr *recipients.RecipientManager // НОВОЕ
 
 	mu    sync.Mutex
 	state State
@@ -191,7 +191,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		location:      location,
 		schedule:      schedule,
 		peers:         opts.Peers,
-		recipientsMgr: opts.RecipientsMgr,  // НОВОЕ
+		recipientsMgr: opts.RecipientsMgr, // НОВОЕ
 		state:         state,
 		urgentCh:      make(chan struct{}, 1),
 		regularCh:     make(chan drainSignal, 1),
@@ -766,8 +766,6 @@ func (q *Queue) previousScheduleAt(now time.Time) time.Time {
 	prev := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), last.hour, last.minute, 0, 0, q.location)
 	return prev.UTC()
 }
-
-
 
 // buildForwardSpec готовит спецификацию пересылки исходного сообщения.
 func buildForwardSpec(msg *tg.Message) (*ForwardSpec, error) {
