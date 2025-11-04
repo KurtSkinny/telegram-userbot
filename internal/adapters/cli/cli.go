@@ -212,7 +212,7 @@ func (s *Service) handleCommand(cmd string) bool {
 	case "refresh dialogs":
 		s.handleRefreshDialogs()
 	case "reload":
-		if err := s.filters.GetFilters(); err != nil {
+		if err := s.filters.Load(); err != nil {
 			pr.ErrPrintln("reload error:", err)
 		} else {
 			pr.Println("filters.json reloaded")
