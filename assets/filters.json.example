@@ -3,7 +3,7 @@
     {
       "id": "brand_mentions",
       "chats_rules": [5000042366],
-      "match": {
+      "match_rules": {
         "keywords_any": ["any","keyword"],
         "keywords_all": ["all", "keywords", "at", "once"],
         "regex": ["(?i)some\\s?regex", "(?i)another\\sregex"],
@@ -20,7 +20,7 @@
     {
       "id": "team_updates",
       "chats_rules": [5000042366, 5000042367],
-      "match": {
+      "match_rules": {
         "keywords_any": ["update", "release"]
       },
       "notify": {
