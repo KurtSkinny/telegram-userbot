@@ -2,6 +2,7 @@ package filters
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -237,7 +238,7 @@ func (fe *FilterEngine) Reload() error {
 		logger.Error("Reload failed: no valid filters found, rolling back to previous state")
 		fe.filters = oldFilters
 		fe.uniqueChats = oldUniqueChats
-		return fmt.Errorf("no valid filters found after reload")
+		return errors.New("no valid filters found after reload")
 	}
 
 	// Обновляем состояние
