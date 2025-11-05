@@ -218,8 +218,8 @@ func (s *Service) handleCommand(cmd string) bool {
 	case "refresh dialogs":
 		s.handleRefreshDialogs()
 	case "reload":
-		// Затем перезагружаем filters (они валидируются по recipients)
-		if err := s.filters.Load(); err != nil {
+		// Перезагружаем фильтры и получателей с rollback при ошибке
+		if err := s.filters.Reload(); err != nil {
 			pr.ErrPrintln("reload filters error:", err)
 			return false
 		}

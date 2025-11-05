@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
@@ -56,14 +55,13 @@ type SendOutcome struct {
 // QueueOptions — зависимости и параметры очереди: транспорт, сторы, расписание, таймзона и часы.
 // Clock допускает внедрение монотонного времени в тестах; по умолчанию используется time.Now.
 type QueueOptions struct {
-	Sender        PreparedSender
-	Store         *QueueStore
-	Failed        *FailedStore
-	Schedule      []string
-	Location      *time.Location
-	Clock         func() time.Time
-	Peers         *peersmgr.Service
-	RecipientsMgr *recipients.RecipientManager // НОВОЕ
+	Sender   PreparedSender
+	Store    *QueueStore
+	Failed   *FailedStore
+	Schedule []string
+	Location *time.Location
+	Clock    func() time.Time
+	Peers    *peersmgr.Service
 }
 
 // scheduleEntry — нормализованный слот расписания в локальной таймзоне.
@@ -99,13 +97,12 @@ type QueueStats struct {
 // Хранит состояние в памяти, синхронизирует его с диском, управляет воркером
 // срочных задач и планировщиком регулярных. Потокобезопасность обеспечивается mutex.
 type Queue struct {
-	sender        PreparedSender
-	store         *QueueStore
-	failed        *FailedStore
-	location      *time.Location
-	schedule      []scheduleEntry
-	peers         *peersmgr.Service
-	recipientsMgr *recipients.RecipientManager // НОВОЕ
+	sender   PreparedSender
+	store    *QueueStore
+	failed   *FailedStore
+	location *time.Location
+	schedule []scheduleEntry
+	peers    *peersmgr.Service
 
 	mu    sync.Mutex
 	state State
@@ -185,17 +182,16 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 	state.Regular = validRegular
 
 	q := &Queue{
-		sender:        opts.Sender,
-		store:         opts.Store,
-		failed:        opts.Failed,
-		location:      location,
-		schedule:      schedule,
-		peers:         opts.Peers,
-		recipientsMgr: opts.RecipientsMgr, // НОВОЕ
-		state:         state,
-		urgentCh:      make(chan struct{}, 1),
-		regularCh:     make(chan drainSignal, 1),
-		now:           nowFn,
+		sender:    opts.Sender,
+		store:     opts.Store,
+		failed:    opts.Failed,
+		location:  location,
+		schedule:  schedule,
+		peers:     opts.Peers,
+		state:     state,
+		urgentCh:  make(chan struct{}, 1),
+		regularCh: make(chan drainSignal, 1),
+		now:       nowFn,
 	}
 
 	logger.Debugf(
@@ -304,10 +300,10 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	// НОВАЯ ЛОГИКА: резолвим получателей через recipients manager
-	resolved := q.recipientsMgr.ResolveToTargets(fres.Filter.Notify.Recipients)
+	// Используем готовые развернутые получатели из фильтра
+	resolved := fres.Filter.ResolvedRecipients
 	if len(resolved) == 0 {
-		return errors.New("notifications queue: no valid recipients")
+		return errors.New("notifications queue: no resolved recipients")
 	}
 
 	// Создаем Job'ы

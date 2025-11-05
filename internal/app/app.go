@@ -14,7 +14,6 @@ import (
 	telegramnotifier "telegram-userbot/internal/adapters/telegram/notifier"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
-	"telegram-userbot/internal/domain/recipients"
 	domainupdates "telegram-userbot/internal/domain/updates"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/config"
@@ -144,22 +143,15 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.updMgr = tgupdates.New(updConfig)
 	updateFunc = contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store()).Handle
 
-	// 1. Инициализация recipients manager
-	recipientsMgr := recipients.NewRecipientManager(config.Env().RecipientsFile)
-	if err := recipientsMgr.Load(); err != nil {
-		return fmt.Errorf("load recipients: %w", err)
-	}
-	logger.Infof("Recipients loaded: %d total", len(recipientsMgr.GetAll()))
-
-	// 2. Инициализация filters с передачей recipients manager
-	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, recipientsMgr)
+	// Инициализация filters (внутри загружает recipients)
+	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
 	if err := a.filters.Load(); err != nil {
 		return fmt.Errorf("load filters: %w", err)
 	}
 	logger.Infof("Filters loaded: %d total, %d unique chats",
 		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
 
-	// 4) Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
+	// Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
 	if err != nil {
 		return fmt.Errorf("init queue store: %w", err)
@@ -188,14 +180,13 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 	// Сборка очереди уведомлений: транспорт, сторы, расписание, таймзона, часы.
 	queue, err := notifications.NewQueue(notifications.QueueOptions{
-		Sender:        sender,
-		Store:         queueStore,
-		Failed:        failedStore,
-		Schedule:      config.Env().NotifySchedule,
-		Location:      loc,
-		Clock:         time.Now,
-		Peers:         a.peers,
-		RecipientsMgr: recipientsMgr,  // НОВОЕ
+		Sender:   sender,
+		Store:    queueStore,
+		Failed:   failedStore,
+		Schedule: config.Env().NotifySchedule,
+		Location: loc,
+		Clock:    time.Now,
+		Peers:    a.peers,
 	})
 	if err != nil {
 		return fmt.Errorf("init notifications queue: %w", err)
@@ -217,7 +208,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.dispatch.OnEditChannelMessage(h.OnEditChannelMessage)
 
 	// 7) Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
-	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers, recipientsMgr)
+	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
 
 	return nil
 }
