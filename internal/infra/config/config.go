@@ -56,6 +56,7 @@ type EnvConfig struct {
 	NotifiedTTLDays   int
 	FiltersFile       string
 	PeersCacheFile    string
+	RecipientsFile    string // НОВОЕ
 }
 
 // Config хранит конфигурацию среды.
@@ -85,6 +86,7 @@ const (
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
+	defaultRecipientsFile    = "assets/recipients.json"
 	defaultPeersCacheFile    = "data/peers_cache.bbolt"
 )
 
@@ -164,6 +166,8 @@ func loadConfig(envPath string) (*Config, error) {
 	notifiedTTLDays := parseIntDefault("NOTIFIED_CACHE_TTL_DAYS", defaultNotifiedTTLDays, greaterThanZero, &warnings)
 	filtersFile := sanitizeFile("FILTERS_FILE", os.Getenv("FILTERS_FILE"), defaultFiltersFile, &warnings)
 	peersCacheFile := sanitizeFile("PEERS_CACHE_FILE", os.Getenv("PEERS_CACHE_FILE"), defaultPeersCacheFile, &warnings)
+	recipientsFile := sanitizeFile("RECIPIENTS_FILE", os.Getenv("RECIPIENTS_FILE"),
+		defaultRecipientsFile, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,
@@ -187,6 +191,7 @@ func loadConfig(envPath string) (*Config, error) {
 		NotifiedCacheFile: notifiedCacheFile,
 		NotifiedTTLDays:   notifiedTTLDays,
 		FiltersFile:       filtersFile,
+		RecipientsFile:    recipientsFile,
 		PeersCacheFile:    peersCacheFile,
 	}
 

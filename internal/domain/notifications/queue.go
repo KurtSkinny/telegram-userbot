@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/domain/recipients"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
@@ -158,6 +157,30 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		nowFn = time.Now
 	}
 
+	// Обработка старых Job при загрузке очереди
+	// Фильтруем старые невалидные Job'ы
+	validUrgent := []Job{}
+	validRegular := []Job{}
+
+	for _, job := range state.Urgent {
+		if job.Recipient.Type == "" || job.Recipient.ID == 0 {
+			logger.Errorf("Queue: skipping invalid urgent job %d (empty recipient)", job.ID)
+			continue
+		}
+		validUrgent = append(validUrgent, job)
+	}
+
+	for _, job := range state.Regular {
+		if job.Recipient.Type == "" || job.Recipient.ID == 0 {
+			logger.Errorf("Queue: skipping invalid regular job %d (empty recipient)", job.ID)
+			continue
+		}
+		validRegular = append(validRegular, job)
+	}
+
+	state.Urgent = validUrgent
+	state.Regular = validRegular
+
 	q := &Queue{
 		sender:    opts.Sender,
 		store:     opts.Store,
@@ -277,12 +300,16 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	jobs := buildJobsFromTargets(fres.Filter.Notify.Recipients, fres.Filter.Urgent, payload)
-	if len(jobs) == 0 {
-		return errors.New("notifications queue: empty recipients list")
-	}
-
-	for _, job := range jobs {
+	// Создаем Job'ы
+	for _, r := range fres.Recipients {
+		job := Job{
+			Urgent: fres.Filter.Notify.Urgent,
+			Recipient: Recipient{
+				Type: string(r.Type),
+				ID:   int64(r.PeerID),
+			},
+			Payload: payload,
+		}
 		jobID := q.enqueue(job)
 		logger.Debugf(
 			"Queue: job %d enqueued (filter=%s urgent=%t recipient=%s:%d)",
@@ -543,7 +570,8 @@ func (q *Queue) processRegular(sig drainSignal) {
 // Возвращает true, если задание было возвращено в очередь или потребовалось ждать online/ctx.
 func (q *Queue) handleJob(job Job) bool {
 	start := q.now()
-	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)", job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
+	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)",
+		job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
 
 	ctx := q.ctx
 	result, err := q.sender.Deliver(ctx, job)
@@ -728,41 +756,6 @@ func (q *Queue) previousScheduleAt(now time.Time) time.Time {
 	yesterday := today.Add(-24 * time.Hour)
 	prev := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), last.hour, last.minute, 0, 0, q.location)
 	return prev.UTC()
-}
-
-// buildJobsFromTargets создает список Job из targets, по одной на каждого получателя.
-func buildJobsFromTargets(t recipients.RecipientTargets, urgent bool, payload Payload) []Job {
-	total := len(t.Users) + len(t.Chats) + len(t.Channels)
-	if total == 0 {
-		return nil
-	}
-	out := make([]Job, 0, total)
-	seen := make(map[string]struct{}, total)
-
-	add := func(kind string, ids []int64) {
-		for _, id := range ids {
-			if id == 0 {
-				continue
-			}
-			key := kind + ":" + strconv.FormatInt(id, 10)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			job := Job{
-				Urgent:    urgent,
-				Recipient: Recipient{Type: kind, ID: id},
-				Payload:   payload,
-			}
-			out = append(out, job)
-		}
-	}
-
-	add(RecipientTypeUser, t.Users)
-	add(RecipientTypeChat, t.Chats)
-	add(RecipientTypeChannel, t.Channels)
-
-	return out
 }
 
 // buildForwardSpec готовит спецификацию пересылки исходного сообщения.

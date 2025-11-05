@@ -143,15 +143,15 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.updMgr = tgupdates.New(updConfig)
 	updateFunc = contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store()).Handle
 
-	// Инициализация и загрузка фильтров
-	a.filters = filters.NewFilterEngine(config.Env().FiltersFile)
-	if loadErr := a.filters.Load(); loadErr != nil {
-		return fmt.Errorf("load filters: %w", loadErr)
+	// Инициализация filters (внутри загружает recipients)
+	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
+	if err := a.filters.Init(); err != nil {
+		return fmt.Errorf("load filters: %w", err)
 	}
 	logger.Infof("Filters loaded: %d total, %d unique chats",
 		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
 
-	// 4) Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
+	// Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
 	if err != nil {
 		return fmt.Errorf("init queue store: %w", err)

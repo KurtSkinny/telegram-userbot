@@ -79,7 +79,13 @@ func NewService(
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
 ) *Service {
-	return &Service{cl: cl, stopApp: stopApp, filters: filterEngine, notif: notif, peers: peers}
+	return &Service{
+		cl:      cl,
+		stopApp: stopApp,
+		filters: filterEngine,
+		notif:   notif,
+		peers:   peers,
+	}
 }
 
 // Start запускает основной цикл CLI в отдельной горутине. Повторные вызовы
@@ -212,11 +218,12 @@ func (s *Service) handleCommand(cmd string) bool {
 	case "refresh dialogs":
 		s.handleRefreshDialogs()
 	case "reload":
-		if err := s.filters.Load(); err != nil {
-			pr.ErrPrintln("reload error:", err)
-		} else {
-			pr.Println("filters.json reloaded")
+		// Перезагружаем фильтры и получателей с rollback при ошибке
+		if err := s.filters.Init(); err != nil {
+			pr.ErrPrintln("reload filters error:", err)
+			return false
 		}
+		pr.Println("recipients.json and filters.json reloaded")
 	case "whoami":
 		if res, err := whoAmI(s.cl); err != nil {
 			pr.ErrPrintln("whoami error:", err)

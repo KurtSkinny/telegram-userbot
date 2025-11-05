@@ -1,110 +1,106 @@
+// Package filters содержит структуры и методы для загрузки, хранения и управления
+// фильтрами сообщений и их получателями.
+// Файл filterengine.go содержит основной движок фильтрации.
 package filters
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"slices"
 	"sync"
-	"telegram-userbot/internal/domain/recipients"
+	"telegram-userbot/internal/domain/tgutil"
+	"telegram-userbot/internal/infra/logger"
+
+	"github.com/gotd/td/tg"
 )
-
-// Match описывает правила совпадения входящих сообщений. Движок фильтрации
-// трактует условие как И/ИЛИ/регексп в зависимости от полей:
-//   - KeywordsAny: достаточно совпадения по ЛЮБОМУ из слов
-//   - KeywordsAll: требуется совпадение по ВСЕМ словам
-//   - Regex: проверка произвольным регулярным выражением
-//   - ExcludeKeywordsAny / ExcludeRegex: выколотые множества для отрицания
-//
-// Совпадение считается успехом, если выполняется хотя бы одно «положительное»
-// условие и одновременно не срабатывает ни одно исключающее.
-type Match struct {
-	KeywordsAny        []string `json:"keywords_any"`
-	KeywordsAll        []string `json:"keywords_all"`
-	Regex              []string `json:"regex"`
-	ExcludeKeywordsAny []string `json:"exclude_any"`
-	ExcludeRegex       []string `json:"exclude_regex"`
-}
-
-// NotifyConfig задает способ доставки уведомления при срабатывании фильтра:
-//   - Recipients: список адресатов (пользователи, чаты, каналы),
-//   - Forward: пересылать ли оригинал сообщения вместо отправки текста,
-//   - Template: форматируемая строка для текстового уведомления.
-//
-// Конкретная реализация уведомителя (client/bot) определяется через EnvConfig.
-type NotifyConfig struct {
-	Recipients recipients.RecipientTargets `json:"recipients"`
-	Forward    bool                        `json:"forward"`
-	Template   string                      `json:"template"`
-}
-
-// Filter описывает законченное правило обработки:
-//   - ID: стабильный идентификатор правила (для логов, отладки, трекинга),
-//   - Chats: из каких источников брать сообщения,
-//   - Match: критерии совпадения,
-//   - Urgent: маркер «срочных» уведомлений (может влиять на канал доставки),
-//   - Notify: параметры маршрутизации уведомлений.
-//
-// NB: «срочность» никак не интерпретируется здесь в конфиге; семантика — на стороне
-// потребителей (например, выбор немедленной отправки вместо расписания).
-type Filter struct {
-	ID     string       `json:"id"`
-	Chats  []int64      `json:"chats"`
-	Match  Match        `json:"match"`
-	Urgent bool         `json:"urgent"`
-	Notify NotifyConfig `json:"notify"`
-}
-
-// FiltersConfig — обертка для корневого JSON: { "filters": [...] }.
-// Удобно иметь явную структуру ради расширений и валидации верхнего уровня.
-type FiltersConfig struct {
-	Filters []Filter `json:"filters"`
-}
 
 // FilterEngine хранит загруженные фильтры и обеспечивает потокобезопасный доступ к ним.
 type FilterEngine struct {
-	filtersPath string
-	filters     []Filter
-	uniqueChats []int64
-	mu          sync.RWMutex
+	filtersPath    string
+	recipientsPath string
+	filters        []Filter
+	recipientsMap  map[RecipientID]Recipient
+	uniqueChats    []int64
+	mu             sync.RWMutex
 }
 
-func NewFilterEngine(filtersPath string) *FilterEngine {
+func NewFilterEngine(filtersPath string, recipientsPath string) *FilterEngine {
 	return &FilterEngine{
-		filtersPath: filtersPath,
+		filtersPath:    filtersPath,
+		recipientsPath: recipientsPath,
 	}
 }
 
-// Load читает и парсит JSON-файл с фильтрами, обновляя внутреннее состояние.
-func (fe *FilterEngine) Load() error {
-	data, readErr := os.ReadFile(filepath.Clean(fe.filtersPath))
-	if readErr != nil {
-		return fmt.Errorf("failed to read filters json: %w", readErr)
+// Init подготавливает внутреннее состояние FilterEngine:
+// - загружает получателй и фильтры
+// - оставляет фильтры только с известными получателями (логирует ошибку если фильтр пропускается)
+// - оставляет только тех получаетелй, которые используются в фильтрах (логирует предупреждение если получатель не используется)
+// и сохраняет мапу с получателями
+// - сохраняет список уникальных чатов
+func (fe *FilterEngine) Init() error {
+	recipients, err := LoadRecipients(fe.recipientsPath)
+	if err != nil {
+		return fmt.Errorf("failed to load recipients: %w", err)
+	}
+	recipientsMap := make(map[RecipientID]Recipient)
+	for _, r := range recipients {
+		recipientsMap[r.ID] = r
 	}
 
-	var filtersConfig FiltersConfig
-	if err := json.Unmarshal(data, &filtersConfig); err != nil {
-		return fmt.Errorf("failed to unmarshal filters json: %w", err)
+	filters, err := LoadFilters(fe.filtersPath)
+	if err != nil {
+		return fmt.Errorf("failed to load filters: %w", err)
 	}
 
-	// Собираем уникальные чаты для быстрой проверки доступа/привязки диалогов
-	unique := make(map[int64]struct{})
-	for _, f := range filtersConfig.Filters {
-		for _, chat := range f.Chats {
-			unique[chat] = struct{}{}
+	// фильтруем фильтры с неизвестными получателями
+	validFilters := make([]Filter, 0, len(filters))
+	for _, f := range filters {
+		allRecipientsKnown := true
+		for _, recID := range f.Notify.Recipients {
+			if _, ok := recipientsMap[RecipientID(recID)]; !ok {
+				logger.Errorf("filter %s references unknown recipient %s, skipping filter", f.ID, recID)
+				allRecipientsKnown = false
+				break
+			}
+		}
+		if allRecipientsKnown {
+			validFilters = append(validFilters, f)
 		}
 	}
-	var chats []int64
-	for chat := range unique {
-		chats = append(chats, chat)
+
+	// проверяем используемых получателей
+	usedRecipients := make(map[RecipientID]struct{})
+	for _, f := range validFilters {
+		for _, recID := range f.Notify.Recipients {
+			usedRecipients[RecipientID(recID)] = struct{}{}
+		}
+	}
+	for recID := range recipientsMap {
+		if _, used := usedRecipients[recID]; !used {
+			logger.Warnf("recipient %s is not used in any filter", recID)
+		}
 	}
 
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
-	fe.filters = filtersConfig.Filters
-	fe.uniqueChats = chats
-
+	fe.filters = validFilters
+	fe.recipientsMap = recipientsMap
+	fe.uniqueChats = uniqueChats(validFilters)
 	return nil
+}
+
+// uniqueChats возвращает срез уникальных идентификаторов чатов из всех фильтров.
+func uniqueChats(filters []Filter) []int64 {
+	uniqueChatsMap := make(map[int64]struct{})
+	for _, f := range filters {
+		for _, chatID := range f.Chats {
+			uniqueChatsMap[chatID] = struct{}{}
+		}
+	}
+	uniqueChats := make([]int64, 0, len(uniqueChatsMap))
+	for chatID := range uniqueChatsMap {
+		uniqueChats = append(uniqueChats, chatID)
+	}
+	return uniqueChats
 }
 
 // GetFilters возвращает актуальную копию среза фильтров. Благодаря RLock
@@ -124,4 +120,58 @@ func (fe *FilterEngine) GetUniqueChats() []int64 {
 	result := make([]int64, len(fe.uniqueChats))
 	copy(result, fe.uniqueChats)
 	return result
+}
+
+// FilterMatchResult связывает фильтр из конфигурации и его результат.
+// Используется для логирования и дальнейшей бизнес‑обработки
+// (например, выбор действия согласно типу фильтра).
+type FilterMatchResult struct {
+	Filter     Filter
+	Recipients []Recipient
+	Result     Result
+}
+
+// ProcessMessage прогоняет сообщение по всем фильтрам из конфигурации и собирает
+// список сработавших фильтров для текущего получателя (peer).
+// Логика:
+//   - peer нормализуется в числовой идентификатор через GetPeerID;
+//   - фильтр учитывается только если peer присутствует в Filter.Chats;
+//   - entities переданы на будущее (ссылки, хэштеги и т. п.) и сейчас не используются;
+//   - порядок результатов соответствует порядку фильтров в конфиге;
+//   - пустой текст сообщения допустим: все include‑условия должны его выдержать, чтобы фильтр сработал.
+func (fe *FilterEngine) ProcessMessage(
+	entities tg.Entities,
+	msg *tg.Message,
+) []FilterMatchResult {
+	if msg == nil {
+		return nil
+	}
+	peerKey := tgutil.GetPeerID(msg.PeerID)
+
+	var results []FilterMatchResult
+
+	for _, f := range fe.GetFilters() {
+		hasChat := slices.Contains(f.Chats, peerKey)
+		if !hasChat {
+			continue
+		}
+		res := MatchMessage(msg.Message, f)
+		if res.Matched {
+			fe.mu.RLock()
+			var recs []Recipient
+			for _, recID := range f.Notify.Recipients {
+				if r, ok := fe.recipientsMap[RecipientID(recID)]; ok {
+					recs = append(recs, r)
+				}
+			}
+			fe.mu.RUnlock()
+
+			results = append(results, FilterMatchResult{
+				Filter:     f,
+				Recipients: recs,
+				Result:     res,
+			})
+		}
+	}
+	return results
 }
