@@ -1,29 +1,31 @@
-{
-  "recipients": {
-    "admin_main": {
-      "type": "user",
-      "peer_id": 5002402758,
-      "note": "Main administrator",
-      "tz": "Europe/Moscow",
-      "schedule": ["09:00", "18:00"]
-    },
-    "user_alice": {
-      "peer_id": 5011122233,
-      "note": "Alice from marketing",
-      "tz": "+03:00",
-      "schedule": ["08:00", "20:00"]
-    },
-    "chat_team": {
-      "type": "chat",
-      "peer_id": 45678902232,
-      "note": "Team chat"
-    },
-    "channel_announcements": {
-      "type": "channel",
-      "peer_id": 1234567890,
-      "note": "Public announcements",
-      "tz": "UTC",
-      "schedule": ["10:00", "16:00"]
-    }
+[
+  {
+    "id": "admin_main",
+    "type": "user",
+    "peer_id": 5002402758,
+    "note": "Main administrator",
+    "tz": "Europe/Moscow",
+    "schedule": ["09:00", "18:00"]
+  },
+  {
+    "id": "user_alice",
+    "peer_id": 5011122233,
+    "note": "Alice from marketing",
+    "tz": "+03:00",
+    "schedule": ["08:00", "20:00"]
+  },
+  {
+    "id": "chat_team",
+    "type": "chat",
+    "peer_id": 45678902232,
+    "note": "Team chat"
+  },
+  {
+    "id": "channel_announcements",
+    "type": "channel",
+    "peer_id": 1234567890,
+    "note": "Public announcements",
+    "tz": "UTC",
+    "schedule": ["10:00", "16:00"]
   }
-}
+]

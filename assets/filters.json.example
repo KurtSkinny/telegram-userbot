@@ -2,7 +2,7 @@
   "filters": [
     {
       "id": "brand_mentions",
-      "chats": [5000042366],
+      "chats_rules": [5000042366],
       "match": {
         "keywords_any": ["any","keyword"],
         "keywords_all": ["all", "keywords", "at", "once"],
@@ -10,8 +10,8 @@
         "exclude_any": ["white", "black"],
         "exclude_regex": ["\\s(papper|coffie)\\s"]
       },
-      "urgent": true,
       "notify": {
+        "urgent": true,
         "recipients": ["admin_main", "user_alice"],
         "forward": true,
         "template": "🔔 Brand mention\nKeywords: {{keywords}}\n🔗 {{message_link}}"
@@ -19,12 +19,12 @@
     },
     {
       "id": "team_updates",
-      "chats": [5000042366, 5000042367],
+      "chats_rules": [5000042366, 5000042367],
       "match": {
         "keywords_any": ["update", "release"]
       },
-      "urgent": false,
       "notify": {
+        "urgent": false,
         "recipients": ["chat_team", "channel_announcements"],
         "forward": false,
         "template": "📢 Team update: {{keywords}}"

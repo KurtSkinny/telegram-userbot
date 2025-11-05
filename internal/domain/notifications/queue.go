@@ -300,19 +300,13 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	// Используем готовые развернутые получатели из фильтра
-	resolved := fres.Filter.ResolvedRecipients
-	if len(resolved) == 0 {
-		return errors.New("notifications queue: no resolved recipients")
-	}
-
 	// Создаем Job'ы
-	for _, r := range resolved {
+	for _, r := range fres.Recipients {
 		job := Job{
-			Urgent: fres.Filter.Urgent,
+			Urgent: fres.Filter.Notify.Urgent,
 			Recipient: Recipient{
-				Type: r.Kind,
-				ID:   r.PeerID,
+				Type: string(r.Type),
+				ID:   int64(r.PeerID),
 			},
 			Payload: payload,
 		}
@@ -576,7 +570,8 @@ func (q *Queue) processRegular(sig drainSignal) {
 // Возвращает true, если задание было возвращено в очередь или потребовалось ждать online/ctx.
 func (q *Queue) handleJob(job Job) bool {
 	start := q.now()
-	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)", job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
+	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)",
+		job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
 
 	ctx := q.ctx
 	result, err := q.sender.Deliver(ctx, job)
