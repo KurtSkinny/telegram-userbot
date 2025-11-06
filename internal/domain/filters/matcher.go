@@ -1,3 +1,4 @@
+// matcher.go содержит функции для матчинга сообщений с фильтрами.
 package filters
 
 import (
