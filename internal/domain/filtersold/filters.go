@@ -1,6 +1,6 @@
 // filter.go содержит структуры и методы для загрузки, хранения и управления
 // фильтрами сообщений.
-package filters
+package filtersold
 
 import (
 	"encoding/json"
