@@ -1,33 +1,111 @@
 {
   "filters": [
     {
-      "id": "brand_mentions",
-      "chats_rules": [5000042366],
-      "match": {
-        "keywords_any": ["any","keyword"],
-        "keywords_all": ["all", "keywords", "at", "once"],
-        "regex": ["(?i)some\\s?regex", "(?i)another\\sregex"],
-        "exclude_any": ["white", "black"],
-        "exclude_regex": ["\\s(papper|coffie)\\s"]
+      "id": "example-keyword-filter",
+      "chats": [1234567890, 9876543210],
+      "rules": {
+        "deny": {
+          "op": "OR",
+          "args": [
+            {"type": "kw", "value": "spam"},
+            {"type": "re", "pattern": "buy\\s+.*\\s+now"}
+          ]
+        },
+        "allow": {
+          "op": "AND",
+          "args": [
+            {"type": "kw", "value": "important"},
+            {"type": "kw", "value": "update"}
+          ]
+        }
       },
       "notify": {
         "urgent": true,
-        "recipients": ["admin_main", "user_alice"],
         "forward": true,
-        "template": "🔔 Brand mention\nKeywords: {{keywords}}\n🔗 {{message_link}}"
+        "recipients": ["admin_main", "user_alice"],
+        "template": ""
       }
     },
     {
-      "id": "team_updates",
-      "chats_rules": [5000042366, 5000042367],
-      "match": {
-        "keywords_any": ["update", "release"]
+      "id": "example-regex-filter",
+      "chats": [1112223334],
+      "rules": {
+        "allow": {
+          "type": "re",
+          "pattern": "\\bCVE-\\d{4}-\\d{4,5}\\b"
+        }
+      },
+      "notify": {
+        "urgent": true,
+        "forward": true,
+        "recipients": ["chat_team", "admin_main"],
+        "template": ""
+      }
+    },
+    {
+      "id": "example-or-filter",
+      "chats": [-1005556667778],
+      "rules": {
+        "allow": {
+          "op": "OR",
+          "args": [
+            {"type": "kw", "value": "golang"},
+            {"type": "kw", "value": "rust"},
+            {"type": "kw", "value": "python"}
+          ]
+        }
       },
       "notify": {
         "urgent": false,
-        "recipients": ["chat_team", "channel_announcements"],
         "forward": false,
-        "template": "📢 Team update: {{keywords}}"
+        "recipients": ["channel_announcements"],
+        "template": ""
+      }
+    },
+    {
+      "id": "example-at-least-filter",
+      "chats": [9998887776],
+      "rules": {
+        "allow": {
+          "op": "AT_LEAST",
+          "n": 2,
+          "args": [
+            {"type": "kw", "value": "urgent"},
+            {"type": "kw", "value": "help"},
+            {"type": "kw", "value": "emergency"},
+            {"type": "kw", "value": "asap"}
+          ]
+        }
+      },
+      "notify": {
+        "urgent": true,
+        "forward": true,
+        "recipients": ["admin_main"],
+        "template": ""
+      }
+    },
+    {
+      "id": "example-not-filter",
+      "chats": [1112223334],
+      "rules": {
+        "allow": {
+          "op": "AND",
+          "args": [
+            {"type": "kw", "value": "meeting"},
+            {
+              "op": "NOT",
+              "args": [
+                {"type": "kw", "value": "canceled"}
+              ]
+            }
+          ]
+        }
+      },
+      "notify": {
+        "urgent": false,
+        "forward": true,
+        "recipients": ["chat_team"],
+        "template": ""
       }
     }
   ]

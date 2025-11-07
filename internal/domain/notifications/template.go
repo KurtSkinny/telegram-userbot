@@ -16,33 +16,38 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-// RenderTemplate заполняет плоский текстовый шаблон плейсхолдерами:
-//   - {{keywords}} — список сработавших ключевых слов, через запятую;
-//   - {{regex}} — фрагмент, совпавший по положительному regex;
-//   - {{message_link}} — публичная ссылка на сообщение.
-//
-// Если данных нет, {{keywords}} и {{regex}} очищаются до пустой строки, а {{message_link}} заменяется на «-».
-// Никакого экранирования не выполняется: ожидается, что текст уже безопасен для выбранного транспорта.
-func RenderTemplate(tmpl string, match filters.Result, link string) string {
+func RenderTemplate(tmpl string, match filters.FilterResult, link string) string {
 	result := tmpl // рабочая копия шаблона, в которую последовательно вносятся замены
-	// Замены выполняются буквально через strings.ReplaceAll, без шаблонизатора и без экранирования.
-	if len(match.Keywords) > 0 {
-		result = strings.ReplaceAll(result, "{{keywords}}", strings.Join(match.Keywords, ", "))
-	} else {
-		result = strings.ReplaceAll(result, "{{keywords}}", "")
-	}
-	if match.RegexMatch != "" {
-		result = strings.ReplaceAll(result, "{{regex}}", match.RegexMatch)
-	} else {
-		result = strings.ReplaceAll(result, "{{regex}}", "")
-	}
-	if link != "" {
-		result = strings.ReplaceAll(result, "{{message_link}}", link)
-	} else {
-		result = strings.ReplaceAll(result, "{{message_link}}", "-")
-	}
 	return result
 }
+
+// // RenderTemplate заполняет плоский текстовый шаблон плейсхолдерами:
+// //   - {{keywords}} — список сработавших ключевых слов, через запятую;
+// //   - {{regex}} — фрагмент, совпавший по положительному regex;
+// //   - {{message_link}} — публичная ссылка на сообщение.
+// //
+// // Если данных нет, {{keywords}} и {{regex}} очищаются до пустой строки, а {{message_link}} заменяется на «-».
+// // Никакого экранирования не выполняется: ожидается, что текст уже безопасен для выбранного транспорта.
+// func RenderTemplate(tmpl string, match filters.Result, link string) string {
+// 	result := tmpl // рабочая копия шаблона, в которую последовательно вносятся замены
+// 	// Замены выполняются буквально через strings.ReplaceAll, без шаблонизатора и без экранирования.
+// 	if len(match.Keywords) > 0 {
+// 		result = strings.ReplaceAll(result, "{{keywords}}", strings.Join(match.Keywords, ", "))
+// 	} else {
+// 		result = strings.ReplaceAll(result, "{{keywords}}", "")
+// 	}
+// 	if match.RegexMatch != "" {
+// 		result = strings.ReplaceAll(result, "{{regex}}", match.RegexMatch)
+// 	} else {
+// 		result = strings.ReplaceAll(result, "{{regex}}", "")
+// 	}
+// 	if link != "" {
+// 		result = strings.ReplaceAll(result, "{{message_link}}", link)
+// 	} else {
+// 		result = strings.ReplaceAll(result, "{{message_link}}", "-")
+// 	}
+// 	return result
+// }
 
 // BuildMessageLink строит публичный URL для сообщения, если это возможно.
 // Приоритет источников имени: сначала entities из апдейта, затем локальный кэш пиров.

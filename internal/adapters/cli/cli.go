@@ -330,9 +330,11 @@ func (s *Service) handleTest() {
 
 	// Формируем получателя в терминах доменной модели уведомлений.
 	recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
-	// Простейший уникальный ID «задания» — текущее время в наносекундах. Достаточно для CLI.
-	jobID := time.Now().UnixNano() // используем текущее время как уникальный идентификатор "задания"
-	randomID := notifications.RandomIDForMessage(jobID, recipient)
+	job := notifications.Job{
+		ID:        time.Now().UnixNano(),
+		CreatedAt: time.Now(),
+	}
+	randomID := notifications.RandomIDForMessage(job, recipient)
 
 	// Готовим запрос отправки сообщения. Текст простой, без entities.
 	req := &tg.MessagesSendMessageRequest{

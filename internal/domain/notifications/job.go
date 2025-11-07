@@ -47,11 +47,11 @@ type Payload struct {
 // Идентификатор ID монотонно растёт и используется, среди прочего, для детерминированного random_id.
 // Порядок доставки получателям — FIFO.
 type Job struct {
-	ID         int64     `json:"id"`
-	CreatedAt  time.Time `json:"created_at"`
-	Urgent     bool      `json:"urgent"`
-	Recipient  Recipient `json:"recipient"`
-	Payload    Payload   `json:"payload"`
+	ID        int64     `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	Urgent    bool      `json:"urgent"`
+	Recipient Recipient `json:"recipient"`
+	Payload   Payload   `json:"payload"`
 }
 
 // State — сериализуемый снимок очереди: бэклоги urgent/regular, счётчик NextID и метки времени.
@@ -111,16 +111,6 @@ func cloneJobs(in []Job) []Job {
 	for i, job := range in {
 		out[i] = job.Clone()
 	}
-	return out
-}
-
-// cloneRecipients делает поверхностную копию. Достаточно copy, так как Recipient — value-тип без вложенных указателей.
-func cloneRecipients(in []Recipient) []Recipient {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]Recipient, len(in))
-	copy(out, in)
 	return out
 }
 

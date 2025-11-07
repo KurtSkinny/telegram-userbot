@@ -115,6 +115,12 @@ func Logger() *zap.Logger {
 	return log
 }
 
+// IsDebugEnabled проверяет, включен ли debug уровень логирования
+// Добавьте эту функцию в ваш logger пакет, если её там нет
+func IsDebugEnabled() bool {
+	return Logger().Level() <= zap.DebugLevel
+}
+
 // Debug пишет структурированное сообщение уровня Debug.
 func Debug(msg string, fields ...zap.Field) { Logger().Debug(msg, fields...) }
 

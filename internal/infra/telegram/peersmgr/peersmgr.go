@@ -142,40 +142,46 @@ func (s *Service) LoadFromStorage(ctx context.Context) error {
 	if !exists {
 		return nil
 	}
-	defer func() {
-		_ = iter.Close()
-	}()
+	defer func() { _ = iter.Close() }()
 
-	users := make([]tg.UserClass, 0)
-	chats := make([]tg.ChatClass, 0)
+	users, chats := make([]tg.UserClass, 0), make([]tg.ChatClass, 0)
+
+	addUser := func(value contribstorage.Peer) {
+		user := value.User
+		if user == nil {
+			user = &tg.User{
+				ID:         value.Key.ID,
+				AccessHash: value.Key.AccessHash,
+			}
+		}
+		users = append(users, user)
+	}
+	addChat := func(value contribstorage.Peer) {
+		chat := value.Chat
+		if chat == nil {
+			chat = &tg.Chat{ID: value.Key.ID}
+		}
+		chats = append(chats, chat)
+	}
+	addChannel := func(value contribstorage.Peer) {
+		channel := value.Channel
+		if channel == nil {
+			channel = &tg.Channel{
+				ID:         value.Key.ID,
+				AccessHash: value.Key.AccessHash,
+			}
+		}
+		chats = append(chats, channel)
+	}
 
 	for iter.Next(ctx) {
-		value := iter.Value()
-		switch value.Key.Kind {
+		switch value := iter.Value(); value.Key.Kind {
 		case dialogs.User:
-			user := value.User
-			if user == nil {
-				user = &tg.User{
-					ID:         value.Key.ID,
-					AccessHash: value.Key.AccessHash,
-				}
-			}
-			users = append(users, user)
+			addUser(value)
 		case dialogs.Chat:
-			chat := value.Chat
-			if chat == nil {
-				chat = &tg.Chat{ID: value.Key.ID}
-			}
-			chats = append(chats, chat)
+			addChat(value)
 		case dialogs.Channel:
-			channel := value.Channel
-			if channel == nil {
-				channel = &tg.Channel{
-					ID:         value.Key.ID,
-					AccessHash: value.Key.AccessHash,
-				}
-			}
-			chats = append(chats, channel)
+			addChannel(value)
 		}
 	}
 

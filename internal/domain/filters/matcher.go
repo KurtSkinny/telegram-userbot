@@ -1,217 +1,66 @@
+// matcher.go содержит функции и логику обработки правил фильтрации сообщений.
 package filters
 
 import (
 	"regexp"
 	"strings"
-
-	"telegram-userbot/internal/infra/logger"
 )
 
-// Result — детальный исход матчинга по одному фильтру.
-// Поля:
-//   - Matched    — финальный флаг срабатывания фильтра;
-//   - Keywords   — список ключевых слов, которые были обнаружены. Порядок соответствует
-//     порядку проверок: сначала KeywordsAll, затем KeywordsAny;
-//   - RegexMatch — фрагмент текста, совпавший с положительным regexp (если он был задан).
-type Result struct {
-	Matched    bool
-	Keywords   []string
-	RegexMatch string
-}
+// MatchMessage проверяет строку по одному фильтру с новой системой фильтрации.
+// Использует детерминированную логику с DENY и ALLOW этапами:
+// 1. DENY: жёсткая чистка мусора. Если совпало хоть одно правило deny — сообщение выбрасывается.
+// 2. ALLOW: выборка нужного. Если есть правила allow, сообщение должно им соответствовать.
+func MatchMessage(text string, f Filter) FilterResult {
+	// Нормализуем текст для проверки
+	normalizedText := normalizeText(text)
 
-// MatchMessage проверяет строку по одному фильтру, двигаясь по конвейеру:
-//  1. includeRegex: пустой шаблон трактуется как "пройдено"; непустой должен дать совпадение
-//     (ищется подстрока, а не полное совпадение).
-//  2. includeKeywordsAll: если список пуст — пройдено; иначе все слова обязаны встретиться.
-//  3. includeKeywordsAny: если список пуст — пройдено; иначе требуется как минимум одно слово.
-//  4. excludeByKeywords: если встретилось любое слово из запрета — отклоняем.
-//  5. excludeByRegex: если regex совпал — отклоняем.
-//
-// Поведение при ошибках:
-//   - ошибки компиляции regexp приводят к возврату пустого Result и логируются;
-//   - возвращаемый Result.Matched выставляется только в случае успешного прохождения всех стадий;
-//   - Result.Keywords содержит объединённый список совпавших ключей из All и Any без дубликатов по позиции.
-func MatchMessage(text string, f Filter) Result {
-	result := Result{}
-
-	if matched, ok, err := includeRegex(text, f.Match.Regex); ok {
-		result.RegexMatch = matched
-	} else {
-		if err != nil {
-			logger.Errorf("error in MatchMessage, includeRegex: %v", err)
-		}
-		return Result{}
-	}
-
-	if matched, ok := includeKeywordsAll(text, f.Match.KeywordsAll); ok {
-		result.Keywords = append(result.Keywords, matched...)
-	} else {
-		return Result{}
-	}
-
-	if matched, ok := includeKeywordsAny(text, f.Match.KeywordsAny); ok {
-		result.Keywords = append(result.Keywords, matched...)
-	} else {
-		return Result{}
-	}
-
-	if excludeByKeywords(text, f.Match.ExcludeKeywordsAny) {
-		return Result{}
-	}
-
-	if ok, err := excludeByRegex(text, f.Match.ExcludeRegex); ok {
-		return Result{}
-	} else if err != nil {
-		logger.Errorf("error in MatchMessage, excludeByRegex: %v", err)
-		return Result{}
-	}
-
-	result.Keywords = dedupPreserveOrderCI(result.Keywords)
-	result.Matched = true
-	return result
-}
-
-// dedupPreserveOrderCI удаляет дубликаты из списка строк без учёта регистра,
-func dedupPreserveOrderCI(ss []string) []string {
-	if len(ss) > 1 {
-		seen := make(map[string]struct{}, len(ss))
-		out := ss[:0]
-		for _, s := range ss {
-			k := strings.ToLower(s)
-			if _, ok := seen[k]; ok {
-				continue
+	// Проверяем DENY
+	if f.Rules.Deny != nil {
+		if match, matchedNode := evalNode(f.Rules.Deny, normalizedText); match {
+			return FilterResult{
+				Matched:     false,
+				ResultType:  Drop,
+				MatchedNode: *matchedNode,
 			}
-			seen[k] = struct{}{}
-			out = append(out, s)
 		}
-		return out
-	} else {
-		return ss
+	}
+
+	// Проверяем ALLOW
+	if f.Rules.Allow != nil {
+		if match, matchedNode := evalNode(f.Rules.Allow, normalizedText); match {
+			return FilterResult{
+				Matched:     true,
+				ResultType:  AllowMatch,
+				MatchedNode: *matchedNode,
+			}
+		} else {
+			return FilterResult{
+				Matched:     false,
+				ResultType:  NoMatch,
+				MatchedNode: *matchedNode,
+			}
+		}
+	}
+
+	// Если allow отсутствует или пуст - PASS_THROUGH
+	return FilterResult{
+		Matched:     true,
+		ResultType:  PassThrough,
+		MatchedNode: Node{}, // No specific node matched
 	}
 }
 
-// includeRegex компилирует и применяет положительный regexp.
-// Пустой pattern трактуется как "совпадает всегда".
-// Возвращает найденный фрагмент, флаг ok и ошибку компиляции/применения.
-// NB: используется re.FindString, поэтому совпадение ищется как подстрока.
-func includeRegex(text string, pattern []string) (string, bool, error) {
-	if len(pattern) == 0 {
-		return "", true, nil
-	}
+// normalizeText нормализует текст для проверки:
+// - ё->е
+// - схлопываем пробелы
+// - приводим любые пробельные символы к одному пробелу
+func normalizeText(text string) string {
+	// Заменяем ё на е
+	result := strings.ReplaceAll(text, "ё", "е")
+	result = strings.ReplaceAll(result, "Ё", "Е")
 
-	for _, p := range pattern {
-		if p == "" {
-			return "", true, nil
-		}
-		re, err := regexp.Compile(p)
-		if err != nil {
-			return "", false, err
-		}
+	// Заменяем любые пробельные символы одним пробелом и схлопываем повторы
+	result = regexp.MustCompile(`\s+`).ReplaceAllString(result, " ")
 
-		match := re.FindString(text)
-		if match != "" {
-			return match, true, nil
-		}
-	}
-
-	return "", false, nil
-}
-
-// includeKeywordsAll — все ключевые слова должны присутствовать в тексте (без учёта регистра).
-// Пустой список означает "условие выполнено".
-// Возвращает список тех ключей, которые были найдены.
-// Пример: text="foo bar", keywords={"foo","bar"} → ok=true, matched={"foo","bar"}.
-func includeKeywordsAll(text string, keywords []string) ([]string, bool) {
-	if len(keywords) == 0 {
-		return nil, true
-	}
-
-	matched := make([]string, 0, len(keywords))
-	for _, kw := range keywords {
-		if !ContainsSmart(text, kw) {
-			return nil, false
-		}
-		matched = append(matched, kw)
-	}
-
-	return matched, true
-}
-
-// includeKeywordsAny — достаточно хотя бы одного ключа (без учёта регистра).
-// Пустой список — условие выполнено.
-// Возвращает список совпавших ключей в порядке перечисления.
-// Пример: text="foo baz", keywords={"bar","foo"} → ok=true, matched={"foo"}.
-func includeKeywordsAny(text string, keywords []string) ([]string, bool) {
-	if len(keywords) == 0 {
-		return nil, true
-	}
-
-	matched := make([]string, 0, len(keywords))
-	for _, kw := range keywords {
-		if ContainsSmart(text, kw) {
-			matched = append(matched, kw)
-		}
-	}
-
-	if len(matched) == 0 {
-		return nil, false
-	}
-
-	return matched, true
-}
-
-// excludeByKeywords — запретительный список: если встретился любой ключ, фильтр должен провалиться.
-func excludeByKeywords(text string, keywords []string) bool {
-	if len(keywords) == 0 {
-		return false
-	}
-
-	for _, kw := range keywords {
-		if ContainsSmart(text, kw) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// excludeByRegex — запретительный regexp.
-// Пустой шаблон означает "ничего не запрещено".
-// При ошибке компиляции возвращается ошибка, чтобы вызывающий мог залогировать и отклонить фильтр.
-func excludeByRegex(text string, pattern []string) (bool, error) {
-	if len(pattern) == 0 {
-		return false, nil
-	}
-
-	if matched, ok, err := includeRegex(text, pattern); ok && matched != "" {
-		return true, nil
-	} else if err != nil {
-		return false, err
-	}
-
-	return false, nil
-}
-
-// ContainsSmart — проверка наличия ключа в тексте с учётом границ слов и регистра.
-// Реализация: строится регэксп вида (?i)(^|[^\p{L}\p{N}])<kw>([^\p{L}\p{N}]|$), где <kw>
-// экранирован через regexp.QuoteMeta. Это даёт:
-//   - нечувствительность к регистру для Unicode;
-//   - корректные границы слов для любых алфавитов (кириллица и др.);
-//   - одинаковую логику как для "словесных" ключей, так и для ключей со спецсимволами.
-//
-// Примеры:
-//
-//	ContainsSmart("foo-bar", "foo")        == true
-//	ContainsSmart("foobar", "foo")         == false
-//	ContainsSmart("Привет, мир", "привет") == true
-//	ContainsSmart("C++ guide", "C++")      == true
-func ContainsSmart(text, kw string) bool {
-	if kw == "" {
-		return false
-	}
-	// Регэксп с Unicode-границами слов.
-	// (?i) — регистронезависимость; QuoteMeta экранирует спецсимволы в ключе.
-	pattern := `(?i)(^|[^\p{L}\p{N}])` + regexp.QuoteMeta(kw) + `([^\p{L}\p{N}]|$)`
-	re := regexp.MustCompile(pattern)
-	return re.FindStringIndex(text) != nil
+	return strings.TrimSpace(result)
 }

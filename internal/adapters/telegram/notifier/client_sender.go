@@ -144,7 +144,7 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 
 	if hasText {
 		skip, retErr := s.handleAPIErr(
-			s.apiSendMessage(ctx, job, recipient, 0, peer),
+			s.apiSendMessage(ctx, job, recipient, peer),
 			recipient, &outcome,
 		)
 		if skip {
@@ -208,18 +208,17 @@ func (s *ClientSender) handleAPIErr(
 }
 
 // apiSendMessage отправляет подготовленный текст конкретному получателю.
-// Использует детерминированный random_id (jobID+recipient+index), чтобы повторы
+// Использует детерминированный random_id (jobID+recipient), чтобы повторы
 // не создавали дубликаты. При активном форварде отключает предпросмотр ссылок
 // (NoWebpage=true), чтобы текст и форвард не конфликтовали визуально.
 func (s *ClientSender) apiSendMessage(
 	ctx context.Context,
 	job notifications.Job,
 	recipient notifications.Recipient,
-	index int,
 	peer tg.InputPeerClass,
 ) error {
 	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient).
-	randomID := notifications.RandomIDForMessage(job.ID, recipient)
+	randomID := notifications.RandomIDForMessage(job, recipient)
 
 	req := &tg.MessagesSendMessageRequest{
 		Peer:     peer,
@@ -278,7 +277,7 @@ func (s *ClientSender) apiForwardMessages(
 	}
 
 	// Для каждого исходного message_id генерируем свой random_id для идемпотентности ретраев.
-	randomIDs := notifications.RandomIDsForForward(job.ID, recipient, fwd.FromPeer, fwd.MessageIDs)
+	randomIDs := notifications.RandomIDsForForward(job, recipient, fwd.FromPeer, fwd.MessageIDs)
 	if len(randomIDs) == 0 {
 		return nil
 	}
@@ -349,61 +348,3 @@ func isPermanentRPCError(err error) bool {
 	}
 	return false
 }
-
-// func (s *ClientSender) DeliverOld(ctx context.Context, job notifications.Job) (notifications.SendOutcome, error) {
-// 	var outcome notifications.SendOutcome
-
-// 	for idx, recipient := range job.Recipients {
-// 		if errPeer != nil {
-// 			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
-// 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 			outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
-// 			continue
-// 		}
-
-// 		if strings.TrimSpace(job.Payload.Text) != "" {
-// 			if err := s.apiSendMessage(ctx, job, recipient, idx, peer); err != nil {
-// 				if stop, underlying, ok := extractStopReason(err); ok {
-// 					switch stop {
-// 					case stopRetryReasonNetwork:
-// 						outcome.NetworkDown = true
-// 						return outcome, underlying
-// 					case stopRetryReasonPermanent:
-// 						outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 						outcome.PermanentError = errors.Join(outcome.PermanentError, underlying)
-// 						continue
-// 					}
-// 				}
-// 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-// 					return outcome, err
-// 				}
-// 				outcome.Retry = true
-// 				return outcome, err
-// 			}
-// 		}
-
-// 		fwd := job.Payload.Forward
-// 		if fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0 {
-// 			if err := s.apiForwardMessages(ctx, job, recipient, peer); err != nil {
-// 				if stop, underlying, ok := extractStopReason(err); ok {
-// 					switch stop {
-// 					case stopRetryReasonNetwork:
-// 						outcome.NetworkDown = true
-// 						return outcome, underlying
-// 					case stopRetryReasonPermanent:
-// 						outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 						outcome.PermanentError = errors.Join(outcome.PermanentError, underlying)
-// 						continue
-// 					}
-// 				}
-// 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-// 					return outcome, err
-// 				}
-// 				outcome.Retry = true
-// 				return outcome, err
-// 			}
-// 		}
-// 	}
-
-// 	return outcome, nil
-// }

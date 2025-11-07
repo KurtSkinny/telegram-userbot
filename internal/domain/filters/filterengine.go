@@ -1,6 +1,5 @@
-// Package filters содержит структуры и методы для загрузки, хранения и управления
-// фильтрами сообщений и их получателями.
-// Файл filterengine.go содержит основной движок фильтрации.
+// Package filters содержит новую систему фильтрации сообщений с детерминированной логикой
+// фильтров. Файл filterengine.go содержит основной движок фильтрации.
 package filters
 
 import (
@@ -30,28 +29,26 @@ func NewFilterEngine(filtersPath string, recipientsPath string) *FilterEngine {
 	}
 }
 
-// Init подготавливает внутреннее состояние FilterEngine:
-// - загружает получателй и фильтры
-// - оставляет фильтры только с известными получателями (логирует ошибку если фильтр пропускается)
-// - оставляет только тех получаетелй, которые используются в фильтрах (логирует предупреждение если получатель не используется)
-// и сохраняет мапу с получателями
-// - сохраняет список уникальных чатов
+// Init подготавливает внутреннее состояние FilterEngine
 func (fe *FilterEngine) Init() error {
 	recipients, err := LoadRecipients(fe.recipientsPath)
 	if err != nil {
 		return fmt.Errorf("failed to load recipients: %w", err)
 	}
-	recipientsMap := make(map[RecipientID]Recipient)
+
+	// Создаем мапу получателей
+	recipientsMap := make(map[RecipientID]Recipient, len(recipients))
 	for _, r := range recipients {
 		recipientsMap[r.ID] = r
 	}
 
+	// Загружаем фильтры (уже валидированные и с предкомпилированными паттернами)
 	filters, err := LoadFilters(fe.filtersPath)
 	if err != nil {
 		return fmt.Errorf("failed to load filters: %w", err)
 	}
 
-	// фильтруем фильтры с неизвестными получателями
+	// Фильтруем фильтры с неизвестными получателями
 	validFilters := make([]Filter, 0, len(filters))
 	for _, f := range filters {
 		allRecipientsKnown := true
@@ -67,7 +64,7 @@ func (fe *FilterEngine) Init() error {
 		}
 	}
 
-	// проверяем используемых получателей
+	// Проверяем используемых получателей
 	usedRecipients := make(map[RecipientID]struct{})
 	for _, f := range validFilters {
 		for _, recID := range f.Notify.Recipients {
@@ -80,11 +77,16 @@ func (fe *FilterEngine) Init() error {
 		}
 	}
 
+	// Однократный захват мьютекса для записи всех данных
 	fe.mu.Lock()
-	defer fe.mu.Unlock()
 	fe.filters = validFilters
 	fe.recipientsMap = recipientsMap
 	fe.uniqueChats = uniqueChats(validFilters)
+	fe.mu.Unlock()
+
+	logger.Infof("FilterEngine initialized: %d filters, %d recipients, %d unique chats",
+		len(validFilters), len(recipientsMap), len(fe.uniqueChats))
+
 	return nil
 }
 
@@ -128,7 +130,44 @@ func (fe *FilterEngine) GetUniqueChats() []int64 {
 type FilterMatchResult struct {
 	Filter     Filter
 	Recipients []Recipient
-	Result     Result
+	Result     FilterResult
+}
+
+// FilterResult — результат вычисления фильтра.
+type FilterResult struct {
+	Matched     bool            // Сработал ли фильтр
+	ResultType  MatchResultType // Тип результата
+	MatchedNode Node            // Узел AST, который дал срабатывание
+}
+
+// MatchResultType — тип результата фильтрации.
+type MatchResultType int
+
+const (
+	// DROP — сработал deny, сообщение выбрасывается
+	Drop MatchResultType = iota
+	// ALLOW_MATCH — deny не сработал и allow дал истину
+	AllowMatch
+	// PASS_THROUGH — deny не сработал, allow пустой → считаем нужным
+	PassThrough
+	// NO_MATCH — deny не сработал, но allow есть и не совпал
+	NoMatch
+)
+
+// String возвращает строковое представление типа результата
+func (mrt MatchResultType) String() string {
+	switch mrt {
+	case Drop:
+		return "DROP"
+	case AllowMatch:
+		return "ALLOW_MATCH"
+	case PassThrough:
+		return "PASS_THROUGH"
+	case NoMatch:
+		return "NO_MATCH"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // ProcessMessage прогоняет сообщение по всем фильтрам из конфигурации и собирает
@@ -139,6 +178,8 @@ type FilterMatchResult struct {
 //   - entities переданы на будущее (ссылки, хэштеги и т. п.) и сейчас не используются;
 //   - порядок результатов соответствует порядку фильтров в конфиге;
 //   - пустой текст сообщения допустим: все include‑условия должны его выдержать, чтобы фильтр сработал.
+//
+// ProcessMessage с оптимизированной работой мьютекса
 func (fe *FilterEngine) ProcessMessage(
 	entities tg.Entities,
 	msg *tg.Message,
@@ -148,23 +189,27 @@ func (fe *FilterEngine) ProcessMessage(
 	}
 	peerKey := tgutil.GetPeerID(msg.PeerID)
 
+	fe.mu.RLock()
+	filters := fe.filters
+	recipientsMapCopy := fe.recipientsMap
+	fe.mu.RUnlock()
+
 	var results []FilterMatchResult
 
-	for _, f := range fe.GetFilters() {
+	for _, f := range filters {
 		hasChat := slices.Contains(f.Chats, peerKey)
 		if !hasChat {
 			continue
 		}
+
 		res := MatchMessage(msg.Message, f)
 		if res.Matched {
-			fe.mu.RLock()
 			var recs []Recipient
 			for _, recID := range f.Notify.Recipients {
-				if r, ok := fe.recipientsMap[RecipientID(recID)]; ok {
+				if r, ok := recipientsMapCopy[RecipientID(recID)]; ok {
 					recs = append(recs, r)
 				}
 			}
-			fe.mu.RUnlock()
 
 			results = append(results, FilterMatchResult{
 				Filter:     f,
@@ -173,5 +218,6 @@ func (fe *FilterEngine) ProcessMessage(
 			})
 		}
 	}
+
 	return results
 }
