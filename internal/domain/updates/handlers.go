@@ -19,9 +19,10 @@ import (
 
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/support/debug"
 
 	"telegram-userbot/internal/infra/config"
@@ -41,6 +42,7 @@ import (
 //   - фоновую очистку устаревших отметок notified и периодический сброс их на диск.
 type Handlers struct {
 	api       *tg.Client                // api предоставляет доступ к TDLib-клиенту для служебных запросов
+	filters   *filters.FilterEngine     // filters содержит движок фильтров для матчинга сообщений
 	notif     *notifications.Queue      // notif отвечает за доставку уведомлений конечному пользователю
 	notified  map[string]time.Time      // notified запоминает, какие комбинации «сообщение-фильтр» уже уведомлялись
 	mu        sync.Mutex                // mu защищает доступ к карте notified в конкурентной среде
@@ -48,6 +50,7 @@ type Handlers struct {
 	debouncer *concurrency.Debouncer    // debouncer сглаживает частые обновления одного сообщения (редактирования)
 	unread    map[int64]int             // unread хранит счётчики непрочитанных сообщений по пирами
 	unreadMu  sync.Mutex                // unreadMu синхронизирует конкурентные обновления карты unread
+	peers     *peersmgr.Service         // peers предоставляет доступ к менеджеру пиров и локальному снапшоту
 
 	notifiedCacheFile string
 	notifiedDirty     bool
@@ -69,12 +72,13 @@ type Handlers struct {
 //   - NotifiedCacheFile — путь файла для периодического флаша notified-кэша.
 //
 // Возвращает полностью инициализированную структуру без запуска фоновых горутин.
-func NewHandlers(api *tg.Client, notif *notifications.Queue,
+func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
 	dup *concurrency.Deduplicator, debouncer *concurrency.Debouncer,
-	shutdown func()) *Handlers {
+	shutdown func(), peers *peersmgr.Service) *Handlers {
 	cfg := config.Env()
 	return &Handlers{
 		api:               api,
+		filters:           filters,
 		notif:             notif,
 		notified:          make(map[string]time.Time),
 		dupCache:          dup,
@@ -83,6 +87,7 @@ func NewHandlers(api *tg.Client, notif *notifications.Queue,
 		cleanTTL:          time.Duration(cfg.NotifiedTTLDays) * 24 * time.Hour,
 		shutdown:          shutdown,
 		notifiedCacheFile: cfg.NotifiedCacheFile,
+		peers:             peers,
 	}
 }
 
@@ -157,13 +162,11 @@ func (h *Handlers) OnNewMessage(
 		return nil
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
 	// сама добавит недостающие сущности в кэш на будущее.
-	_, _ = cache.GetInputPeerRaw(entities, msg)
-
 	// Быстрая защита от повторной обработки: та же комбинация
 	// (peerID, msgID, editDate) уже приходила и была обработана.
 	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
@@ -183,13 +186,13 @@ func (h *Handlers) OnNewMessage(
 	}
 
 	logger.Debug("OnNewMessage")
-	debug.PrintUpdate("DM/Group", msg, entities)
-	results := filters.ProcessMessage(entities, msg)
+	debug.PrintUpdate("DM/Group", msg, entities, h.peers)
+	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
 		}
-		if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+		if err := h.notif.Notify(entities, msg, res); err != nil {
 			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
 			logger.Errorf("notify enqueue error: %v", err)
 			continue
@@ -214,25 +217,23 @@ func (h *Handlers) OnNewChannelMessage(
 		return nil
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	// Подтягиваем и прогреваем кэш соответствий peer -> inputPeer.
 	// Ошибки намеренно игнорируются: отсутствие записи не критично, а функция
 	// сама добавит недостающие сущности в кэш на будущее.
-	_, _ = cache.GetInputPeerRaw(entities, msg)
-
 	// Дедупликация по (peerID, msgID, editDate) для каналов.
 	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
 		return nil
 	}
 	logger.Debug("OnNewChannelMessage")
-	debug.PrintUpdate("Channel", msg, entities)
-	results := filters.ProcessMessage(entities, msg)
+	debug.PrintUpdate("Channel", msg, entities, h.peers)
+	results := h.filters.ProcessMessage(entities, msg)
 	for _, res := range results {
 		if h.hasNotified(msg, res.Filter.ID) {
 			continue
 		}
-		if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+		if err := h.notif.Notify(entities, msg, res); err != nil {
 			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
 			logger.Errorf("notify enqueue error: %v", err)
 			continue
@@ -259,16 +260,16 @@ func (h *Handlers) OnEditMessage(
 	}
 	// logger.Warnf("msg: %v", pr.Pf(msg))
 	logger.Debug("OnEditMessage")
-	debug.PrintUpdate("OnEditMessage", msg, entities)
+	debug.PrintUpdate("OnEditMessage", msg, entities, h.peers)
 	// Дебаунсим лавину апдейтов при частых правках одного и того же сообщения.
 	h.debouncer.Do(msg.ID, func() {
-		if !h.dupCache.DedupSeen(filters.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
-			results := filters.ProcessMessage(entities, msg)
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+			results := h.filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue
 				}
-				if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+				if err := h.notif.Notify(entities, msg, res); err != nil {
 					logger.Errorf("notify enqueue error: %v", err)
 					continue
 				}
@@ -292,16 +293,16 @@ func (h *Handlers) OnEditChannelMessage(
 		return nil
 	}
 	logger.Debug("OnEditChannelMessage")
-	debug.PrintUpdate("OnEditChannelMessage", msg, entities)
+	debug.PrintUpdate("OnEditChannelMessage", msg, entities, h.peers)
 	// Дебаунсим частые правки сообщений канала, чтобы не заспамить очередь.
 	h.debouncer.Do(msg.ID, func() {
-		if !h.dupCache.DedupSeen(filters.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
-			results := filters.ProcessMessage(entities, msg)
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+			results := h.filters.ProcessMessage(entities, msg)
 			for _, res := range results {
 				if h.hasNotified(msg, res.Filter.ID) {
 					continue
 				}
-				if err := h.notif.Notify(ctx, entities, msg, res); err != nil {
+				if err := h.notif.Notify(entities, msg, res); err != nil {
 					logger.Errorf("notify enqueue error: %v", err)
 					continue
 				}

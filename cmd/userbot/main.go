@@ -38,13 +38,20 @@ func main() {
 
 	// envPath определяет расположение .env с секретами и общими настройками.
 	envPath := flag.String("env", "assets/.env", "path to .env file")
-	// filtersPath указывает на JSON-файл с фильтрами, используемыми userbot.
-	filtersPath := flag.String("filters", "assets/filters.json", "path to filters.json")
+	// // filtersPath указывает на JSON-файл с фильтрами, используемыми userbot.
 	flag.Parse()
 
-	// config.Load собирает финальную конфигурацию из файла окружения и набора фильтров.
-	if err := config.Load(*envPath, *filtersPath); err != nil {
+	// config.Load загружает конфигурацию из .env и других источников.
+	if err := config.Load(*envPath); err != nil {
 		log.Fatalf("failed to load config: %v", err)
+	}
+	// Применяем часовую зону приложения (поддерживает IANA и UTC‑смещение). Влияет глобально на time.Local.
+	if locApp, err := config.ParseLocation(config.Env().AppTimezone); err != nil {
+		log.Fatalf("failed to parse APP_TIMEZONE: %v", err)
+	} else {
+		time.Local = locApp //nolint:reassign // намеренно задаём часовую зону процесса (приложение работает в выбранной TZ)
+		// Обновляем префикс bootstrap‑логгера, чтобы отражать выбранную часовую зону.
+		log.SetPrefix(time.Now().Format("2006-01-02 15:04:05 "))
 	}
 
 	// logger.Init задаёт уровень, а SetWriters перенаправляет выводы в подсистему pr (чтобы видеть логи в CLI UI).

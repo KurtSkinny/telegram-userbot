@@ -14,11 +14,10 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,143 +50,23 @@ type EnvConfig struct {
 	NotifyQueueFile   string
 	NotifyFailedFile  string
 	NotifyTimezone    string
+	AppTimezone       string
 	NotifySchedule    []string
 	NotifiedCacheFile string
 	NotifiedTTLDays   int
+	FiltersFile       string
+	PeersCacheFile    string
+	RecipientsFile    string // НОВОЕ
 }
 
-// Match описывает правила совпадения входящих сообщений. Движок фильтрации
-// трактует условие как И/ИЛИ/регексп в зависимости от полей:
-//   - KeywordsAny: достаточно совпадения по ЛЮБОМУ из слов
-//   - KeywordsAll: требуется совпадение по ВСЕМ словам
-//   - Regex: проверка произвольным регулярным выражением
-//   - ExcludeKeywordsAny / ExcludeRegex: выколотые множества для отрицания
-//
-// Совпадение считается успехом, если выполняется хотя бы одно «положительное»
-// условие и одновременно не срабатывает ни одно исключающее.
-type Match struct {
-	KeywordsAny        []string `json:"keywords_any"`
-	KeywordsAll        []string `json:"keywords_all"`
-	Regex              string   `json:"regex"`
-	ExcludeKeywordsAny []string `json:"exclude_any"`
-	ExcludeRegex       string   `json:"exclude_regex"`
-}
-
-// RecipientTargets поддерживает два формата конфигурации получателей:
-//  1. исторический плоский массив []int64 (трактуется как Users),
-//  2. новый объект с раздельными полями users/chats/channels.
-//
-// Метод UnmarshalJSON обеспечивает обратную совместимость и устраняет
-// нули/дубликаты, сохраняя порядок первых вхождений.
-type RecipientTargets struct {
-	Users    []int64 `json:"users"`
-	Chats    []int64 `json:"chats"`
-	Channels []int64 `json:"channels"`
-}
-
-// UnmarshalJSON реализует особую десериализацию для RecipientTargets:
-// пытается распарсить вход как []int64; если не получилось — как объект
-// {users, chats, channels}. Нули и повторы удаляются, чтобы избежать кривых
-// адресатов в рантайме при доставке уведомлений.
-func (r *RecipientTargets) UnmarshalJSON(b []byte) error {
-	// Попытка распарсить как старый формат: []int64
-	var flat []int64
-	if err := json.Unmarshal(b, &flat); err == nil {
-		r.Users = uniqueNonZero(flat)
-		r.Chats = nil
-		r.Channels = nil
-		return nil
-	}
-	// Пробуем новый формат: объект
-	var tmp struct {
-		Users    []int64 `json:"users"`
-		Chats    []int64 `json:"chats"`
-		Channels []int64 `json:"channels"`
-	}
-	if err := json.Unmarshal(b, &tmp); err != nil {
-		return err
-	}
-	r.Users = uniqueNonZero(tmp.Users)
-	r.Chats = uniqueNonZero(tmp.Chats)
-	r.Channels = uniqueNonZero(tmp.Channels)
-	return nil
-}
-
-// uniqueNonZero удаляет нули и дубликаты из списка ID, сохраняя порядок
-// первого появления. Возвращает nil, если в результате список пуст.
-//
-// Причина: нулевые/повторные ID часто возникают при ручном редактировании
-// конфигов и приводят к «мусору» при маршрутизации уведомлений.
-func uniqueNonZero(in []int64) []int64 {
-	if len(in) == 0 {
-		return nil
-	}
-	seen := make(map[int64]struct{}, len(in))
-	out := make([]int64, 0, len(in))
-	for _, v := range in {
-		if v == 0 {
-			continue
-		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// NotifyConfig задает способ доставки уведомления при срабатывании фильтра:
-//   - Recipients: список адресатов (пользователи, чаты, каналы),
-//   - Forward: пересылать ли оригинал сообщения вместо отправки текста,
-//   - Template: форматируемая строка для текстового уведомления.
-//
-// Конкретная реализация уведомителя (client/bot) определяется через EnvConfig.
-type NotifyConfig struct {
-	Recipients RecipientTargets `json:"recipients"`
-	Forward    bool             `json:"forward"`
-	Template   string           `json:"template"`
-}
-
-// Filter описывает законченное правило обработки:
-//   - ID: стабильный идентификатор правила (для логов, отладки, трекинга),
-//   - Chats: из каких источников брать сообщения,
-//   - Match: критерии совпадения,
-//   - Urgent: маркер «срочных» уведомлений (может влиять на канал доставки),
-//   - Notify: параметры маршрутизации уведомлений.
-//
-// NB: «срочность» никак не интерпретируется здесь в конфиге; семантика — на стороне
-// потребителей (например, выбор немедленной отправки вместо расписания).
-type Filter struct {
-	ID     string       `json:"id"`
-	Chats  []int64      `json:"chats"`
-	Match  Match        `json:"match"`
-	Urgent bool         `json:"urgent"`
-	Notify NotifyConfig `json:"notify"`
-}
-
-// FiltersConfig — обертка для корневого JSON: { "filters": [...] }.
-// Удобно иметь явную структуру ради расширений и валидации верхнего уровня.
-type FiltersConfig struct {
-	Filters []Filter `json:"filters"`
-}
-
-// Config агрегирует конфигурацию среды и набор фильтров. Здесь хранится также
-// кеш «уникальных чатов», чтобы быстро решать, можно ли обрабатывать диалог,
-// и предупреждения, возникшие при чтении .env. Доступ защищен мьютексом.
+// Config хранит конфигурацию среды.
 //
 // Потокобезопасность: публичные геттеры берут RLock. Перезагрузка фильтров
 // (loadFilters) держит эксклюзивный Lock на время обновления полей.
 type Config struct {
-	Env         EnvConfig
-	filters     []Filter     // десериализованный набор фильтров из JSON
-	uniqueChats []int64      // кэш уникальных чатов, упрощающий проверки доступа
-	filtersPath string       // путь к файлу filters.json для повторной загрузки
-	warnings    []string     // предупреждения, накопленные при чтении окружения
-	mu          sync.RWMutex // защита конкурентного доступа к конфигурации
+	Env      EnvConfig
+	warnings []string     // предупреждения, накопленные при чтении окружения
+	mu       sync.RWMutex // защита конкурентного доступа к конфигурации
 }
 
 // Значения по умолчанию для параметров окружения и связанных файлов.
@@ -203,8 +82,12 @@ const (
 	defaultNotifyQueueFile   = "data/notify_queue.json"
 	defaultNotifyFailedFile  = "data/notify_failed.json"
 	defaultNotifyTimezone    = "Europe/Moscow"
+	defaultAppTimezone       = "UTC"
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
+	defaultFiltersFile       = "assets/filters.json"
+	defaultRecipientsFile    = "assets/recipients.json"
+	defaultPeersCacheFile    = "data/peers_cache.bbolt"
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
@@ -216,14 +99,13 @@ var (
 
 // Load — точка входа для инициализации глобальной конфигурации всего приложения.
 // При первом вызове:
-//  1. читает .env и filters.json,
-//  2. формирует EnvConfig и фильтры,
-//  3. подсчитывает кэш уникальных чатов,
+//  1. читает .env,
+//  2. формирует EnvConfig,
 //  4. фиксирует результат в singleton cfgInstance.
 //
 // Повторный вызов запрещен (возвращается ошибка), чтобы избежать гонок
 // конфигурации на старте.
-func Load(envPath, filtersPath string) error {
+func Load(envPath string) error {
 	if cfgDone {
 		return errors.New("config already loaded")
 	}
@@ -232,7 +114,7 @@ func Load(envPath, filtersPath string) error {
 	}
 	cfgInstance.mu.Lock()
 	defer cfgInstance.mu.Unlock()
-	newCfg, err := loadConfig(envPath, filtersPath)
+	newCfg, err := loadConfig(envPath)
 	cfgInstance = newCfg
 	cfgDone = true
 	return err
@@ -240,7 +122,7 @@ func Load(envPath, filtersPath string) error {
 
 // loadConfig выполняет фактическую загрузку/валидацию без установки глобального
 // состояния. Удобно для тестов: можно собрать временный Config и проверить его.
-func loadConfig(envPath, filtersPath string) (*Config, error) {
+func loadConfig(envPath string) (*Config, error) {
 	if err := godotenv.Load(envPath); err != nil {
 		return nil, fmt.Errorf("failed to load .env: %w", err)
 	}
@@ -276,11 +158,16 @@ func loadConfig(envPath, filtersPath string) (*Config, error) {
 		defaultNotifyQueueFile, &warnings)
 	notifyFailedFile := sanitizeFile("NOTIFY_FAILED_FILE", os.Getenv("NOTIFY_FAILED_FILE"),
 		defaultNotifyFailedFile, &warnings)
-	notifyTimezone := sanitizeTimezone(os.Getenv("NOTIFY_TIMEZONE"), defaultNotifyTimezone, &warnings)
+	notifyTimezone := sanitizeTimezoneFlexible(os.Getenv("NOTIFY_TIMEZONE"), defaultNotifyTimezone, &warnings)
+	appTimezone := sanitizeTimezoneFlexible(os.Getenv("APP_TIMEZONE"), defaultAppTimezone, &warnings)
 	notifySchedule := sanitizeSchedule(os.Getenv("NOTIFY_SCHEDULE"), defaultNotifySchedule, &warnings)
 	notifiedCacheFile := sanitizeFile("NOTIFIED_CACHE_FILE", os.Getenv("NOTIFIED_CACHE_FILE"),
 		defaultNotifiedCacheFile, &warnings)
 	notifiedTTLDays := parseIntDefault("NOTIFIED_CACHE_TTL_DAYS", defaultNotifiedTTLDays, greaterThanZero, &warnings)
+	filtersFile := sanitizeFile("FILTERS_FILE", os.Getenv("FILTERS_FILE"), defaultFiltersFile, &warnings)
+	peersCacheFile := sanitizeFile("PEERS_CACHE_FILE", os.Getenv("PEERS_CACHE_FILE"), defaultPeersCacheFile, &warnings)
+	recipientsFile := sanitizeFile("RECIPIENTS_FILE", os.Getenv("RECIPIENTS_FILE"),
+		defaultRecipientsFile, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,
@@ -299,93 +186,21 @@ func loadConfig(envPath, filtersPath string) (*Config, error) {
 		NotifyQueueFile:   notifyQueueFile,
 		NotifyFailedFile:  notifyFailedFile,
 		NotifyTimezone:    notifyTimezone,
+		AppTimezone:       appTimezone,
 		NotifySchedule:    notifySchedule,
 		NotifiedCacheFile: notifiedCacheFile,
 		NotifiedTTLDays:   notifiedTTLDays,
+		FiltersFile:       filtersFile,
+		RecipientsFile:    recipientsFile,
+		PeersCacheFile:    peersCacheFile,
 	}
 
 	cfg := &Config{
-		Env:         env,
-		filtersPath: filtersPath,
-		warnings:    warnings,
-	}
-
-	if cfgErr := cfg.loadFilters(); cfgErr != nil {
-		return nil, cfgErr
+		Env:      env,
+		warnings: warnings,
 	}
 
 	return cfg, nil
-}
-
-// loadFilters перечитывает filters.json, десериализует и пересобирает кэш
-// уникальных чатов. Метод держит эксклюзивный Lock на период обновления, чтобы
-// читатели всегда видели целостное состояние.
-func (c *Config) loadFilters() error {
-	data, readErr := os.ReadFile(filepath.Clean(c.filtersPath))
-	if readErr != nil {
-		return fmt.Errorf("failed to read filters json: %w", readErr)
-	}
-
-	var filters FiltersConfig
-	if err := json.Unmarshal(data, &filters); err != nil {
-		return fmt.Errorf("failed to unmarshal filters json: %w", err)
-	}
-
-	// Собираем уникальные чаты для быстрой проверки доступа/привязки диалогов
-	unique := make(map[int64]struct{})
-	for _, f := range filters.Filters {
-		for _, chat := range f.Chats {
-			unique[chat] = struct{}{}
-		}
-	}
-	var chats []int64
-	for chat := range unique {
-		chats = append(chats, chat)
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.filters = filters.Filters
-	c.uniqueChats = chats
-
-	return nil
-}
-
-// LoadFilters — внешняя обертка для горячего перечитывания filters.json.
-// Ожидается вызывать из админ-команд или сторожей, когда конфиг фильтров
-// меняется на диске. Гарантирует потокобезопасное обновление.
-func LoadFilters() error {
-	return cfgInstance.loadFilters()
-}
-
-// GetFilters возвращает актуальную копию среза фильтров. Благодаря RLock
-// и копированию наружу, вызывающий код не может повредить внутреннее состояние.
-func (c *Config) GetFilters() []Filter {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.filters
-}
-
-// Filters — пакетный геттер для глобального singleton. Удобен в местах,
-// где не держат ссылку на Config, но нужно быстро получить правила.
-func Filters() []Filter {
-	return cfgInstance.GetFilters()
-}
-
-// GetUniqueChats возвращает копию множества всех чатов, встречающихся во всех
-// фильтрах. Отдаётся новый срез, чтобы внешний код не мог модифицировать кеш.
-func (c *Config) GetUniqueChats() []int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	// копия, чтобы не отдавать внутренний срез наружу
-	result := make([]int64, len(c.uniqueChats))
-	copy(result, c.uniqueChats)
-	return result
-}
-
-// UniqueChats — пакетный геттер для списка уникальных чатов из singleton.
-func UniqueChats() []int64 {
-	return cfgInstance.GetUniqueChats()
 }
 
 // Warnings возвращает накопленные предупреждения, возникшие при загрузке .env
@@ -502,20 +317,85 @@ func sanitizeFile(name, value, fallback string, warnings *[]string) string {
 	return v
 }
 
-// sanitizeTimezone проверяет корректность часовой зоны (через time.LoadLocation).
-// При ошибке подставляет fallback. Важно для корректного исполнения расписаний
-// уведомлений и интерпретации локального времени.
-func sanitizeTimezone(value string, fallback string, warnings *[]string) string {
-	tz := strings.TrimSpace(value)
-	if tz == "" {
-		appendWarningf(warnings, "env NOTIFY_TIMEZONE is not set; using default %q", fallback)
+// ParseLocation разбирает либо IANA‑таймзону (например, "Europe/Moscow"),
+// либо UTC‑смещение (например, "+03:00", "-0700", "UTC+3", "GMT-04:30").
+// Возвращает *time.Location или ошибку.
+func ParseLocation(value string) (*time.Location, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, errors.New("empty timezone")
+	}
+	// Try IANA first.
+	if loc, err := time.LoadLocation(v); err == nil {
+		return loc, nil
+	}
+	// Try to parse UTC offset forms.
+	if loc, ok := parseUTCOffsetToLocation(v); ok {
+		return loc, nil
+	}
+	return nil, fmt.Errorf("invalid timezone %q: not an IANA name or UTC offset", value)
+}
+
+// sanitizeTimezoneFlexible проверяет, что значение — корректная IANA‑зона или UTC‑смещение.
+// При неудаче возвращает значение по умолчанию и добавляет предупреждение.
+func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		appendWarningf(warnings, "env %s is not set; using default %q", "<timezone>", fallback)
 		return fallback
 	}
-	if _, err := time.LoadLocation(tz); err != nil {
-		appendWarningf(warnings, "env NOTIFY_TIMEZONE value %q is invalid; using default %q", tz, fallback)
+	if _, err := ParseLocation(v); err != nil {
+		appendWarningf(warnings, "timezone %q is invalid; using default %q", v, fallback)
 		return fallback
 	}
-	return tz
+	return v
+}
+
+// parseUTCOffsetToLocation парсит строки вида "+03:00", "-0700", "UTC+3", "GMT-04:30" или "Z".
+// Возвращает фиксированную таймзону и ok=true при успешном разборе.
+func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
+	v := strings.TrimSpace(strings.ToUpper(value))
+	if v == "Z" || v == "UTC" || v == "GMT" {
+		return time.FixedZone("UTC+00:00", 0), true
+	}
+	// Normalize optional UTC/GMT prefix
+	v = strings.TrimPrefix(v, "UTC")
+	v = strings.TrimPrefix(v, "GMT")
+	v = strings.TrimSpace(v)
+	// Patterns: +HH, -HH, +HHMM, -HHMM, +HH:MM, -HH:MM
+	re := regexp.MustCompile(`^([+-])\s*(\d{1,2})(?::?(\d{2}))?$`)
+	m := re.FindStringSubmatch(v)
+	if m == nil {
+		return nil, false
+	}
+	sign := 1
+	if m[1] == "-" {
+		sign = -1
+	}
+	hourStr := m[2]
+	minStr := m[3]
+	hours, err := strconv.Atoi(hourStr)
+	if err != nil {
+		return nil, false
+	}
+	mins := 0
+	if minStr != "" {
+		var err2 error
+		mins, err2 = strconv.Atoi(minStr)
+		if err2 != nil {
+			return nil, false
+		}
+	}
+	if hours < 0 || hours > 14 || mins < 0 || mins > 59 {
+		return nil, false
+	}
+	const (
+		secInHour = 60 * 60
+		secInMin  = 60
+	)
+	offset := sign * ((hours * secInHour) + (mins * secInMin))
+	name := fmt.Sprintf("UTC%+03d:%02d", sign*hours, mins)
+	return time.FixedZone(name, offset), true
 }
 
 // sanitizeSchedule парсит CSV-строку формата "HH:MM,HH:MM,...", фильтрует

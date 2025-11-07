@@ -12,15 +12,17 @@ import (
 	botapionotifier "telegram-userbot/internal/adapters/botapi/notifier"
 	"telegram-userbot/internal/adapters/telegram/core"
 	telegramnotifier "telegram-userbot/internal/adapters/telegram/notifier"
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	domainupdates "telegram-userbot/internal/domain/updates"
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/infra/telegram/session"
 
+	contribstorage "github.com/gotd/contrib/storage"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
 	tgupdates "github.com/gotd/td/telegram/updates"
@@ -37,6 +39,7 @@ import (
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
 	cl        *core.ClientCore          // Авторизованный клиент gotd и его API-обёртка (Self, вызовы tg).
+	filters   *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
 	dupCache  *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).
 	debouncer *concurrency.Debouncer    // Сглаживание бурстов (частые правки одного сообщения и т.п.).
@@ -44,13 +47,18 @@ type App struct {
 	dispatch  *tg.UpdateDispatcher      // Маршрутизатор апдейтов gotd: OnNewMessage/OnEdit/etc.
 	runner    *Runner                   // Оркестратор жизненного цикла и CLI.
 	updMgr    *tgupdates.Manager        // Менеджер апдейтов gotd: поток событий и локальное состояние.
+	peers     *peersmgr.Service         // Менеджер пиров + persist storage.
 	ctx       context.Context           // Внешний контекст приложения (отменяется по сигналам/CLI).
 	stop      context.CancelFunc        // Инициирует общий shutdown.
 }
 
 // CleanPeriodHours — периодичность очистки внутренних фильтров/кэшей уведомлений (часы),
 // чтобы не накапливать устаревшие записи во время длительной работы.
-const CleanPeriodHours = 24
+const (
+	CleanPeriodHours = 24
+	notifierClient   = "client"
+	notifierBot      = "bot"
+)
 
 // NewApp создаёт пустой каркас приложения. Фактическая инициализация выполняется в Init().
 func NewApp() *App {
@@ -71,23 +79,25 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.ctx = ctx
 	a.stop = stop
 	a.dispatch = func(d tg.UpdateDispatcher) *tg.UpdateDispatcher { return &d }(tg.NewUpdateDispatcher())
+	var updateFunc func(context.Context, tg.UpdatesClass) error
+	updateHandlerProxy := telegram.UpdateHandlerFunc(func(handlerCtx context.Context, updates tg.UpdatesClass) error {
+		if updateFunc != nil {
+			return updateFunc(handlerCtx, updates)
+		}
+		if a.updMgr != nil {
+			return a.updMgr.Handle(handlerCtx, updates)
+		}
+		return nil
+	})
 
-	// 1) Конфигурация менеджера апдейтов: хранилище состояния и обработчик обновлений.
-	updConfig := tgupdates.Config{
-		Handler: a.dispatch,
-		Storage: core.NewFileStorage(config.Env().StateFile),
-		// Logger:  logger.Logger().Named("Update_Manager"),
-	}
-
-	// Создаём менеджер апдейтов. Он будет источником событий для диспетчера.
-	a.updMgr = tgupdates.New(updConfig)
-
-	// 2) Опции MTProto‑клиента: сессии, хуки апдейтов, поведение при dead‑соединении и паспорт устройства.
+	// 1) Опции MTProto‑клиента: сессии, хуки апдейтов, поведение при dead‑соединении и паспорт устройства.
 	options := telegram.Options{
 		SessionStorage: &session.NotifyStorage{Path: config.Env().SessionFile},
-		UpdateHandler:  a.updMgr,
+		UpdateHandler:  updateHandlerProxy,
 		Middlewares: []telegram.Middleware{
-			updhook.UpdateHook(a.updMgr.Handle),
+			updhook.UpdateHook(func(mwCtx context.Context, updates tg.UpdatesClass) error {
+				return updateHandlerProxy.Handle(mwCtx, updates)
+			}),
 			// connstate.Middleware(updhook.UpdateHook(a.updMgr.Handle)),
 		},
 		// При сообщении от gotd о «мертвом» соединении отмечаем отключение для зависимых узлов.
@@ -115,10 +125,33 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	}
 	a.cl = cl
 
-	// Инициализация кэша пиров: ускоряет резолв пользователей/диалогов в обработчиках.
-	cache.Init(ctx, cl.API)
+	peersSvc, err := peersmgr.New(cl.API, config.Env().PeersCacheFile)
+	if err != nil {
+		return fmt.Errorf("init peers manager: %w", err)
+	}
+	if err = peersSvc.LoadFromStorage(ctx); err != nil {
+		return fmt.Errorf("load peers storage: %w", err)
+	}
+	a.peers = peersSvc
 
-	// 4) Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
+	updConfig := tgupdates.Config{
+		Handler:      a.dispatch,
+		Storage:      core.NewFileStorage(config.Env().StateFile),
+		AccessHasher: peersSvc.Mgr,
+		// Logger:  logger.Logger().Named("Update_Manager"),
+	}
+	a.updMgr = tgupdates.New(updConfig)
+	updateFunc = contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store()).Handle
+
+	// Инициализация filters (внутри загружает recipients)
+	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
+	if filtersErr := a.filters.Init(); filtersErr != nil {
+		return fmt.Errorf("load filters: %w", filtersErr)
+	}
+	logger.Infof("Filters loaded: %d total, %d unique chats",
+		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
+
+	// Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
 	if err != nil {
 		return fmt.Errorf("init queue store: %w", err)
@@ -129,7 +162,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	}
 
 	// Таймзона для расписания уведомлений берётся из конфигурации.
-	loc, err := time.LoadLocation(config.Env().NotifyTimezone)
+	loc, err := config.ParseLocation(config.Env().NotifyTimezone)
 	if err != nil {
 		return fmt.Errorf("load notify timezone: %w", err)
 	}
@@ -137,9 +170,9 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	// Выбор транспорта уведомлений: client (userbot) или bot (Bot API).
 	var sender notifications.PreparedSender
 	switch config.Env().Notifier {
-	case "client":
-		sender = telegramnotifier.NewClientSender(a.cl.API, config.Env().ThrottleRPS)
-	case "bot":
+	case notifierClient:
+		sender = telegramnotifier.NewClientSender(a.cl.API, config.Env().ThrottleRPS, a.peers)
+	case notifierBot:
 		sender = botapionotifier.NewBotSender(config.Env().BotToken, config.Env().TestDC, config.Env().ThrottleRPS)
 	default:
 		return errors.New(`invalid NOTIFIER option in .env (must be "client" or "bot")`)
@@ -153,6 +186,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 		Schedule: config.Env().NotifySchedule,
 		Location: loc,
 		Clock:    time.Now,
+		Peers:    a.peers,
 	})
 	if err != nil {
 		return fmt.Errorf("init notifications queue: %w", err)
@@ -164,7 +198,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
 
 	// 6) Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
-	h := domainupdates.NewHandlers(cl.API, a.notif, a.dupCache, a.debouncer, a.stop)
+	h := domainupdates.NewHandlers(cl.API, a.filters, a.notif, a.dupCache, a.debouncer, a.stop, a.peers)
 	a.handlers = h
 
 	// Маршрутизация апдейтов на доменные обработчики.
@@ -174,7 +208,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.dispatch.OnEditChannelMessage(h.OnEditChannelMessage)
 
 	// 7) Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
-	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.notif, a.dupCache, a.debouncer, a.handlers)
+	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
 
 	return nil
 }

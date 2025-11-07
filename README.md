@@ -10,7 +10,7 @@ MTProto‑юзербот на Go 1.25, построенный на базе [got
 ## Возможности
 
 - **MTProto‑клиент** с интерактивной авторизацией (номер, код, 2FA), сохранением сессии и устойчивым переподключением.
-- **Фильтры**: `keywords_any`, `keywords_all`, `regex`, отрицания `exclude_any` и `exclude_regex`; источники по списку чатов/пользователей/каналов.
+- **Фильтры**: новая система фильтрации с поддержкой логических операций (`AND`, `OR`, `NOT`, `AT_LEAST`), ключевых слов и регулярных выражений, с DENY/ALLOW логикой; источники по списку чатов/пользователей/каналов.
 - **Очередь уведомлений**:
   - два контура доставки: `urgent` (уведомления отправляются немедленно) и `regular` (добавляются в очередь и уходят по расписанию), FIFO;
   - персист на диск с атомарной записью, журнал неудачных уведомлений;
@@ -68,6 +68,7 @@ cp assets/.env.example assets/.env
 | `NOTIFIED_CACHE_TTL_DAYS` | TTL кэша уведомлений | `30` |
 | `NOTIFY_TIMEZONE` | часовой пояс расписания | `Europe/Moscow` |
 | `NOTIFY_SCHEDULE` | расписание уведомлений, формат `HH:MM[,HH:MM...]` | `08:00,17:00` |
+| `RECIPIENTS_FILE` | файл с определениями получателей | `assets/recipients.json` |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `debug` |
 | `TEST_DC` | `true` для тестового DC (MTProto и Bot API) | `false` |
 | `ADMIN_UID` | UID администратора для сервисных уведомлений и для команды `test` | `0` |
@@ -76,7 +77,45 @@ cp assets/.env.example assets/.env
 
 Приоритет настроек: **CLI‑флаги > переменные окружения > значения по умолчанию**.
 
-### 4) Описать правила (`filters.json`)
+### 4) Описать получателей (`recipients.json`)
+
+Создайте файл с определением получателей:
+
+```bash
+cp assets/recipients.json.example assets/recipients.json
+```
+
+**Расположение:** `assets/recipients.json` (настраивается через переменную окружения `RECIPIENTS_FILE`)
+
+**Формат:**
+- `recipients` - мапа определений получателей, ключ - уникальный ID получателя
+  - `kind` - тип получателя: `user`, `chat`, или `channel` (по умолчанию: `user`)
+  - `peer_id` - **обязательное поле**, Telegram peer ID
+  - `note` - опциональное описание или отображаемое имя
+  - `tz` - опциональная временная зона (IANA имя или UTC смещение в формате "+03:00")
+  - `schedule` - опциональное расписание доставки в формате массива "HH:MM"
+
+**Пример:**
+```json
+{
+  "recipients": {
+    "admin_main": {
+      "kind": "user",
+      "peer_id": 5002402758,
+      "note": "Main administrator",
+      "tz": "Europe/Moscow",
+      "schedule": ["09:00", "18:00"]
+    },
+    "chat_team": {
+      "kind": "chat",
+      "peer_id": 45678902232,
+      "note": "Team chat"
+    }
+  }
+}
+```
+
+### 5) Описать правила (`filters.json`)
 
 Скопируйте пример:
 
@@ -84,30 +123,55 @@ cp assets/.env.example assets/.env
 cp assets/filters.json.example assets/filters.json
 ```
 
-Структура:
+**Новая система фильтров**
+
+Структура нового формата:
 
 ```json
 {
   "filters": [
     {
-      "id": "support-alerts",
-      "chats": [123456789, 987654321],
-      "match": {
-        "keywords_any": ["urgent", "incident", "pager"],
-        "keywords_all": ["site", "down"],
-        "regex": "(?i)sev[12]",
-        "exclude_any": ["test", "sandbox"],
-        "exclude_regex": "\\bdebug\\b"
-      },
-      "urgent": true,
-      "notify": {
-        "recipients": {
-          "users":   [111111111],
-          "chats":   [2222222222],
-          "channels":[3333333333]
+      "id": "example-keyword-filter",
+      "chats": [
+        -1001234567890,
+        -1009876543210
+      ],
+      "rules": {
+        "deny": {
+          "op": "OR",
+          "args": [
+            {
+              "type": "kw",
+              "value": "spam"
+            },
+            {
+              "type": "re",
+              "pattern": "buy\\s+.*\\s+now"
+            }
+          ]
         },
-        "forward": false,
-        "template": "Искомые слова: {{keywords}}\\nregex: {{regex}}\\nСсылка: {{message_link}}"
+        "allow": {
+          "op": "AND",
+          "args": [
+            {
+              "type": "kw",
+              "value": "important"
+            },
+            {
+              "type": "kw",
+              "value": "update"
+            }
+          ]
+        }
+      },
+      "notify": {
+        "urgent": true,
+        "forward": true,
+        "recipients": [
+          "kurts",
+          "admin"
+        ],
+        "template": ""
       }
     }
   ]
@@ -117,14 +181,20 @@ cp assets/filters.json.example assets/filters.json
 **Формат:** чистый JSON без комментариев. Пояснения к полям:
 
 - `chats` — ID диалогов; получить можно командой `list` в CLI.
-- `match` — участвуют только присутствующие подполя; каждое присутствующее условие обязано совпасть:
-  - `keywords_any` — должно совпасть хотя бы одно слово;
-  - `keywords_all` — должны совпасть все слова;
-  - `regex` — регулярное выражение по тексту сообщения; для регистронезависимости используйте префикс `(?i)`;
-  - исключения `exclude_any` и `exclude_regex` имеют приоритет: одно срабатывание отклоняет сообщение.
-- `urgent` — при значении `true` уведомление минует расписание и отправляется сразу; иначе попадает в очередь и уйдет в ближайшее окно из `NOTIFY_SCHEDULE`.
-- `notify.recipients` — поддерживаются `users`, `chats`, `channels`. Короткая форма `recipients: [uid, ...]` допустима для списка пользователей.
-- `template` — строка с плейсхолдерами (см. ниже).
+- `rules` — новая система правил с поддержкой логических операций:
+  - `deny` — правила, при срабатывании которых сообщение отбрасывается (имеют приоритет над `allow`);
+  - `allow` — правила, которые определяют, какие сообщения должны быть разрешены;
+  - Поддерживаются логические операции: `AND`, `OR`, `NOT`, `AT_LEAST`;
+  - Узлы-листья могут быть двух типов: `kw` (ключевые слова) и `re` (регулярные выражения);
+  - `AT_LEAST` позволяет задать условие "как минимум N из M" с параметром `n`.
+- `notify.recipients` — массив строк ID получателей из `recipients.json`. Все указанные ID должны существовать в `recipients.json`.
+- `notify.urgent` — при значении `true` уведомление минует расписание и отправляется сразу; иначе попадает в очередь и уйдет в ближайшее окно из `NOTIFY_SCHEDULE`.
+- `notify.forward` — пересылать исходное сообщение или отправить в виде текста.
+- `notify.template` — строка с плейсхолдерами (см. ниже).
+
+- DENY/ALLOW логика: сначала проверяется `deny`, затем `allow`
+- Поддерживаются логические операции: `AND`, `OR`, `NOT`, `AT_LEAST`
+- Формат `match` заменен на `rules` с более гибкой системой выражений
 
 Подстановки в шаблоне: `{{keywords}}`, `{{regex}}`, `{{message_link}}`. Ссылки строятся как `https://t.me/<username>/<message_id>` при наличии username; иначе формируется `tg://` ссылка.
 

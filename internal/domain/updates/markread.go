@@ -11,14 +11,13 @@ package updates
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"time"
 
-	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/infra/config"
+	"telegram-userbot/internal/domain/tgutil"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
 	tgruntime "telegram-userbot/internal/infra/telegram/runtime"
 	"telegram-userbot/internal/infra/telegram/status"
@@ -81,13 +80,12 @@ func (h *Handlers) runMarkReadScheduler(ctx context.Context) {
 // Ошибки разрешения пиров логируются и не блокируют обработку остальных.
 func (h *Handlers) flushUnread(ctx context.Context) {
 	h.unreadMu.Lock()
-	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для cache.GetInputPeerRaw.
-	entities := tg.Entities{}
+	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для разрешения через peers менеджер.
 	messages := []*tg.Message{}
 
 	for peerID, maxID := range h.unread {
 		// Уважаем белый список: если чат не разрешён конфигурацией, очищаем запись и пропускаем.
-		if !slices.Contains(config.UniqueChats(), peerID) {
+		if !slices.Contains(h.filters.GetUniqueChats(), peerID) {
 			delete(h.unread, peerID)
 			continue
 		}
@@ -108,8 +106,11 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 
 		for _, candidate := range candidates {
 			msg.PeerID = candidate
-			// Best‑effort разрешение через локальный кэш: на успех достаточно любой подходящей формы peer.
-			if _, err := cache.GetInputPeerRaw(entities, msg); err == nil {
+			if h.peers == nil {
+				lastErr = errors.New("peers manager is not available")
+				continue
+			}
+			if _, err := h.peers.InputPeerFromMessage(ctx, msg); err == nil {
 				resolved = true
 				break
 			} else {
@@ -139,7 +140,7 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 
 	for i, msg := range messages {
 		// Помечаем диалог как прочитанный до msg.ID. Между чатами — пауза.
-		h.markRead(ctx, entities, msg)
+		h.markRead(ctx, msg)
 		if i < len(messages)-1 {
 			tgruntime.WaitRandomTimeMs(ctx, readDelayMinMs, readDelayMaxMs)
 		}
@@ -156,14 +157,18 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 //
 // Перед каждым вызовом дожидается онлайна, ошибки пробрасывает в connection.HandleError
 // и при успехе синхронизирует локальный кэш lastUnreadCache, чтобы не повторять работу.
-func (h *Handlers) markRead(ctx context.Context, entities tg.Entities, msg *tg.Message) {
-	peer, pErr := cache.GetInputPeerRaw(entities, msg)
+func (h *Handlers) markRead(ctx context.Context, msg *tg.Message) {
+	if h.peers == nil {
+		logger.Error("markRead: peers manager is not available")
+		return
+	}
+	peer, pErr := h.peers.InputPeerFromMessage(ctx, msg)
 	if pErr != nil {
-		logger.Errorf("markRead: get input peer failed: %v", pErr.Error())
+		logger.Errorf("markRead: get input peer failed: %v", pErr)
 		return
 	}
 
-	peerID := filters.GetPeerID(msg.PeerID)
+	peerID := tgutil.GetPeerID(msg.PeerID)
 
 	switch p := peer.(type) {
 	case *tg.InputPeerUser, *tg.InputPeerChat:

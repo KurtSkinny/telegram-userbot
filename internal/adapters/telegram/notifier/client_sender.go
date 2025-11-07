@@ -15,8 +15,8 @@ import (
 
 	"telegram-userbot/internal/domain/notifications"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/cache"
 	"telegram-userbot/internal/infra/telegram/connection"
+	"telegram-userbot/internal/infra/telegram/peersmgr"
 	telegramruntime "telegram-userbot/internal/infra/telegram/runtime"
 	"telegram-userbot/internal/infra/telegram/status"
 	"telegram-userbot/internal/infra/throttle"
@@ -62,12 +62,16 @@ func (e *stopRetryError) Reason() stopRetryReason { return e.reason }
 type ClientSender struct {
 	api     *tg.Client
 	limiter *throttle.Throttler
+	peers   *peersmgr.Service
 }
 
 // NewClientSender создаёт PreparedSender, оборачивая tg.Client троттлером.
 // Параметр rps задаёт целевую среднюю частоту запросов. Подключён
 // FloodWaitExtractor для корректной паузы при FLOOD_WAIT/FLOOD_PREMIUM_WAIT.
-func NewClientSender(api *tg.Client, rps int) *ClientSender {
+func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSender {
+	if peers == nil {
+		panic("ClientSender: peers manager must not be nil")
+	}
 	// Троттлер ограничивает RPS и умеет извлекать обязательные паузы из FLOOD_WAIT.
 	throttler := throttle.New(
 		rps,
@@ -77,6 +81,7 @@ func NewClientSender(api *tg.Client, rps int) *ClientSender {
 	return &ClientSender{
 		api:     api,
 		limiter: throttler,
+		peers:   peers,
 	}
 }
 
@@ -108,14 +113,14 @@ func (s *ClientSender) BeforeDrain(ctx context.Context) {
 	telegramruntime.WaitRandomTime(ctx)
 }
 
-// Deliver выполняет одно задание: для каждого получателя по FIFO:
+// Deliver выполняет одно задание: для получателя в job:
 //  1. резолвит peer через локальный кэш;
 //  2. ждёт онлайна и имитирует набор текста;
 //  3. отправляет текст; при необходимости — пересылает оригиналы;
 //  4. классифицирует ошибки: permanent → пропуск адресата, network → выход,
 //     прочие → возврат с флагом Retry.
 //
-// Возвращает агрегированный SendOutcome и ошибку, если требуется прерывание дренирования.
+// Возвращает SendOutcome и ошибку, если требуется прерывание дренирования.
 func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (notifications.SendOutcome, error) {
 	var outcome notifications.SendOutcome
 
@@ -124,44 +129,43 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	fwd := job.Payload.Forward
 	needForward := fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0
 
-	for idx, recipient := range job.Recipients {
-		peer, errPeer := cache.GetInputPeerByKind(recipient.Type, recipient.ID)
-		if errPeer != nil {
-			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
-			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-			outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
-			continue
+	recipient := job.Recipient
+	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
+	if errPeer != nil {
+		logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
+		outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
+		outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
+		return outcome, nil
+	}
+
+	// Убеждаемся, что соединение живо, и показываем «typing».
+	connection.WaitOnline(ctx)
+	status.DoTypingWaitChars(ctx, peer, job.Payload.Text)
+
+	if hasText {
+		skip, retErr := s.handleAPIErr(
+			s.apiSendMessage(ctx, job, recipient, peer),
+			recipient, &outcome,
+		)
+		if skip {
+			return outcome, nil
 		}
-
-		// Перед каждым адресатом убеждаемся, что соединение живо, и показываем «typing».
-		connection.WaitOnline(ctx)
-		status.DoTypingWaitChars(ctx, peer, job.Payload.Text)
-
-		if hasText {
-			skip, retErr := s.handleAPIErr(
-				s.apiSendMessage(ctx, job, recipient, idx, peer),
-				recipient, &outcome,
-			)
-			if skip {
-				continue
-			}
-			if retErr != nil {
-				return outcome, retErr
-			}
+		if retErr != nil {
+			return outcome, retErr
 		}
+	}
 
-		if needForward {
-			skip, retErr := s.handleAPIErr(
-				s.apiForwardMessages(ctx, job, recipient, peer),
-				recipient, &outcome,
-			)
+	if needForward {
+		skip, retErr := s.handleAPIErr(
+			s.apiForwardMessages(ctx, job, recipient, peer),
+			recipient, &outcome,
+		)
 
-			if skip {
-				continue
-			}
-			if retErr != nil {
-				return outcome, retErr
-			}
+		if skip {
+			return outcome, nil
+		}
+		if retErr != nil {
+			return outcome, retErr
 		}
 	}
 
@@ -204,18 +208,17 @@ func (s *ClientSender) handleAPIErr(
 }
 
 // apiSendMessage отправляет подготовленный текст конкретному получателю.
-// Использует детерминированный random_id (jobID+recipient+index), чтобы повторы
+// Использует детерминированный random_id (jobID+recipient), чтобы повторы
 // не создавали дубликаты. При активном форварде отключает предпросмотр ссылок
 // (NoWebpage=true), чтобы текст и форвард не конфликтовали визуально.
 func (s *ClientSender) apiSendMessage(
 	ctx context.Context,
 	job notifications.Job,
 	recipient notifications.Recipient,
-	index int,
 	peer tg.InputPeerClass,
 ) error {
-	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient,index).
-	randomID := notifications.RandomIDForMessage(job.ID, recipient, index)
+	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient).
+	randomID := notifications.RandomIDForMessage(job, recipient)
 
 	req := &tg.MessagesSendMessageRequest{
 		Peer:     peer,
@@ -265,7 +268,7 @@ func (s *ClientSender) apiForwardMessages(
 	toPeer tg.InputPeerClass,
 ) error {
 	fwd := job.Payload.Forward
-	fromPeer, err := cache.GetInputPeerByKind(fwd.FromPeer.Type, fwd.FromPeer.ID)
+	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
 	if err != nil {
 		return &stopRetryError{
 			err:    fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err),
@@ -274,7 +277,7 @@ func (s *ClientSender) apiForwardMessages(
 	}
 
 	// Для каждого исходного message_id генерируем свой random_id для идемпотентности ретраев.
-	randomIDs := notifications.RandomIDsForForward(job.ID, recipient, fwd.FromPeer, fwd.MessageIDs)
+	randomIDs := notifications.RandomIDsForForward(job, recipient, fwd.FromPeer, fwd.MessageIDs)
 	if len(randomIDs) == 0 {
 		return nil
 	}
@@ -345,62 +348,3 @@ func isPermanentRPCError(err error) bool {
 	}
 	return false
 }
-
-// func (s *ClientSender) DeliverOld(ctx context.Context, job notifications.Job) (notifications.SendOutcome, error) {
-// 	var outcome notifications.SendOutcome
-
-// 	for idx, recipient := range job.Recipients {
-// 		peer, errPeer := cache.GetInputPeerByKind(recipient.Type, recipient.ID)
-// 		if errPeer != nil {
-// 			logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
-// 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 			outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
-// 			continue
-// 		}
-
-// 		if strings.TrimSpace(job.Payload.Text) != "" {
-// 			if err := s.apiSendMessage(ctx, job, recipient, idx, peer); err != nil {
-// 				if stop, underlying, ok := extractStopReason(err); ok {
-// 					switch stop {
-// 					case stopRetryReasonNetwork:
-// 						outcome.NetworkDown = true
-// 						return outcome, underlying
-// 					case stopRetryReasonPermanent:
-// 						outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 						outcome.PermanentError = errors.Join(outcome.PermanentError, underlying)
-// 						continue
-// 					}
-// 				}
-// 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-// 					return outcome, err
-// 				}
-// 				outcome.Retry = true
-// 				return outcome, err
-// 			}
-// 		}
-
-// 		fwd := job.Payload.Forward
-// 		if fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0 {
-// 			if err := s.apiForwardMessages(ctx, job, recipient, peer); err != nil {
-// 				if stop, underlying, ok := extractStopReason(err); ok {
-// 					switch stop {
-// 					case stopRetryReasonNetwork:
-// 						outcome.NetworkDown = true
-// 						return outcome, underlying
-// 					case stopRetryReasonPermanent:
-// 						outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-// 						outcome.PermanentError = errors.Join(outcome.PermanentError, underlying)
-// 						continue
-// 					}
-// 				}
-// 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-// 					return outcome, err
-// 				}
-// 				outcome.Retry = true
-// 				return outcome, err
-// 			}
-// 		}
-// 	}
-
-// 	return outcome, nil
-// }
