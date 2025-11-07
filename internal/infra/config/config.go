@@ -389,7 +389,11 @@ func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
 	if hours < 0 || hours > 14 || mins < 0 || mins > 59 {
 		return nil, false
 	}
-	offset := sign * ((hours * 60 * 60) + (mins * 60))
+	const (
+		secInHour = 60 * 60
+		secInMin  = 60
+	)
+	offset := sign * ((hours * secInHour) + (mins * secInMin))
 	name := fmt.Sprintf("UTC%+03d:%02d", sign*hours, mins)
 	return time.FixedZone(name, offset), true
 }

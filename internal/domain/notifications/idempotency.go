@@ -20,9 +20,10 @@ const (
 // Вход включает jobID и тип/ID получателя.
 // Это гарантирует устойчивость к ретраям и отсутствие дублей в пределах адресата.
 // Важно: уникальность обеспечивается на уровне комбинации (jobID, recipient).
-func RandomIDForMessage(jobID int64, recipient Recipient) int64 {
+func RandomIDForMessage(job Job, recipient Recipient) int64 {
 	return randomIDFromParts(
-		uint64(jobID), // #nosec G115
+		uint64(job.ID),                   // #nosec G115
+		uint64(job.CreatedAt.UnixNano()), // #nosec G115
 		recipientTypeKey(recipient.Type),
 		uint64(recipient.ID), // #nosec G115
 	)
@@ -32,11 +33,12 @@ func RandomIDForMessage(jobID int64, recipient Recipient) int64 {
 // Хэш смешивает jobID, тип/ID получателя, тип/ID источника и сами message_id.
 // Дополнительно учитывается позиция i, чтобы различать сообщения с одинаковыми ID в разных позициях.
 // Таким образом Telegram будет дедуплицировать ретраи, но не склеивать разные элементы батча.
-func RandomIDsForForward(jobID int64, recipient Recipient, from Recipient, messageIDs []int) []int64 {
+func RandomIDsForForward(job Job, recipient Recipient, from Recipient, messageIDs []int) []int64 {
 	out := make([]int64, len(messageIDs))
 	for i, messageID := range messageIDs {
 		out[i] = randomIDFromParts(
-			uint64(jobID), // #nosec G115
+			uint64(job.ID),                   // #nosec G115
+			uint64(job.CreatedAt.UnixNano()), // #nosec G115
 			recipientTypeKey(recipient.Type),
 			uint64(recipient.ID),            // #nosec G115
 			recipientTypeKey(from.Type)+100, //nolint: mnd // так надо

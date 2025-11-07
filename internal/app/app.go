@@ -145,8 +145,8 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 	// Инициализация filters (внутри загружает recipients)
 	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
-	if err := a.filters.Init(); err != nil {
-		return fmt.Errorf("load filters: %w", err)
+	if filtersErr := a.filters.Init(); filtersErr != nil {
+		return fmt.Errorf("load filters: %w", filtersErr)
 	}
 	logger.Infof("Filters loaded: %d total, %d unique chats",
 		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
