@@ -8,7 +8,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -26,6 +25,9 @@ import (
 
 	"telegram-userbot/internal/infra/telegram/status"
 
+	"github.com/go-faster/errors"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
 	tgupdates "github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
@@ -38,7 +40,7 @@ import (
 //   - корректное завершение: сначала останавливаются узлы (статусы/очереди), затем гасится MTProto‑движок,
 //   - интеграцию с CLI и доменными обработчиками обновлений.
 type Runner struct {
-	cl      *core.ClientCore          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
+	client  *telegram.Client          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
 	filters *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif   *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
 	dedup   *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
@@ -54,7 +56,7 @@ type Runner struct {
 func NewRunner(
 	ctx context.Context,
 	stop context.CancelFunc,
-	cl *core.ClientCore,
+	client *telegram.Client,
 	filters *filters.FilterEngine,
 	notif *notifications.Queue,
 	dedup *concurrency.Deduplicator,
@@ -65,7 +67,7 @@ func NewRunner(
 	return &Runner{
 		ctx:     ctx,
 		stop:    stop,
-		cl:      cl,
+		client:  client,
 		filters: filters,
 		notif:   notif,
 		dedup:   dedup,
@@ -83,7 +85,7 @@ func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 	clientCtx, clientCancel := context.WithCancel(context.Background())
 	defer clientCancel()
 
-	return r.cl.Client.Run(clientCtx, func(ctx context.Context) error {
+	return r.client.Run(clientCtx, func(ctx context.Context) error {
 		logger.Info("Userbot running...")
 
 		self, loginErr := r.loginSelf(ctx)
@@ -105,15 +107,23 @@ func (r *Runner) Run(updmgr *tgupdates.Manager) error {
 }
 
 func (r *Runner) loginSelf(ctx context.Context) (*tg.User, error) {
-	if err := r.cl.Login(ctx); err != nil {
-		return nil, err
+	// 2) Готовим интерактивный сценарий
+	flow := auth.NewFlow(
+		core.TerminalAuthenticator{PhoneNumber: config.Env().PhoneNumber},
+		auth.SendCodeOptions{},
+	)
+
+	if err := r.client.Auth().IfNecessary(ctx, flow); err != nil {
+		return nil, errors.Wrap(err, "auth")
 	}
-	self, err := r.cl.Client.Self(ctx)
+
+	self, err := r.client.Self(ctx)
 	if err != nil {
 		return nil, err
 	}
 	logger.Logger().Info("Logged in as:",
 		zap.String("FirstName", self.FirstName),
+		zap.String("LastName", self.LastName),
 		zap.String("Username", self.Username),
 		zap.Int64("ID", self.ID),
 	)
@@ -136,7 +146,7 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 		logger.Errorf("failed to load peers from storage: %v", err)
 	}
 
-	if err := r.peers.WarmupIfEmpty(ctx, r.cl.API); err != nil {
+	if err := r.peers.WarmupIfEmpty(ctx, r.client.API()); err != nil {
 		logger.Errorf("failed to warm up peers manager: %v", err)
 		if config.Env().Notifier == notifierClient {
 			logger.Error("peers warmup error, cant use client notifier")
@@ -247,7 +257,7 @@ func (r *Runner) registerClientNodes(
 		"",
 		nil,
 		func(nodeCtx context.Context) (context.Context, error) {
-			connection.Init(nodeCtx, r.cl.Client)
+			connection.Init(nodeCtx, r.client)
 			return nodeCtx, nil
 		},
 		func(context.Context) error {
@@ -266,7 +276,7 @@ func (r *Runner) registerClientNodes(
 		"connection_manager",
 		nil,
 		func(nodeCtx context.Context) (context.Context, error) {
-			status.Init(nodeCtx, r.cl.API)
+			status.Init(nodeCtx, r.client.API())
 			return nodeCtx, nil
 		},
 		func(context.Context) error {
@@ -365,7 +375,7 @@ func (r *Runner) registerClientNodes(
 		// После завершения менеджера (по ошибке или отмене) инициируем общий shutdown через r.stop().
 		updatesWG.Go(func() {
 			logger.Debug("updates_manager node: Run started")
-			mgrErr := updmgr.Run(nodeCtx, r.cl.API, selfID, tgupdates.AuthOptions{
+			mgrErr := updmgr.Run(nodeCtx, r.client.API(), selfID, tgupdates.AuthOptions{
 				Forget:  false,
 				OnStart: r.handleUpdatesManagerStart,
 			})
@@ -400,7 +410,7 @@ func (r *Runner) registerClientNodes(
 
 	// Узел: cli
 	// Сервис интерактивных команд. Не блокирует основную петлю, но может инициировать shutdown через r.stop().
-	cliService := cli.NewService(r.cl, r.stop, r.filters, r.notif, r.peers)
+	cliService := cli.NewService(r.client, r.stop, r.filters, r.notif, r.peers)
 	if err := lc.Register(
 		"cli",
 		"",

@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"telegram-userbot/internal/adapters/telegram/core"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	"telegram-userbot/internal/infra/config"
@@ -24,6 +23,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/status"
 	versioninfo "telegram-userbot/internal/support/version"
 
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 )
@@ -56,7 +56,7 @@ var (
 // и синхронно закрывается через Stop(). Потокобезопасность обеспечивается
 // дисциплиной запуска/остановки и отсутствием внешних мутаций.
 type Service struct {
-	cl        *core.ClientCore      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
+	client    *telegram.Client      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
 	stopApp   context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
 	filters   *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue  // очередь уведомлений; нужна для flush/status
@@ -73,14 +73,14 @@ const refreshDialogsTimeout = 30 * time.Second
 // остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
 // команда "flush" инициирует внеочередной слив регулярной очереди уведомлений.
 func NewService(
-	cl *core.ClientCore,
+	client *telegram.Client,
 	stopApp context.CancelFunc,
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
 ) *Service {
 	return &Service{
-		cl:      cl,
+		client:  client,
 		stopApp: stopApp,
 		filters: filterEngine,
 		notif:   notif,
@@ -225,7 +225,7 @@ func (s *Service) handleCommand(cmd string) bool {
 		}
 		pr.Println("recipients.json and filters.json reloaded")
 	case "whoami":
-		if res, err := whoAmI(s.cl); err != nil {
+		if res, err := whoAmI(s.client); err != nil {
 			pr.ErrPrintln("whoami error:", err)
 		} else {
 			pr.Println(res)
@@ -264,7 +264,7 @@ func (s *Service) handleRefreshDialogs() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), refreshDialogsTimeout)
 	defer cancel()
-	if err := s.peers.RefreshDialogs(ctx, s.cl.API); err != nil {
+	if err := s.peers.RefreshDialogs(ctx, s.client.API()); err != nil {
 		pr.ErrPrintln("refresh dialogs error:", err)
 		return
 	}
@@ -347,7 +347,7 @@ func (s *Service) handleTest() {
 
 	// if err := s.notif.Send(ctx, adminID, message); err != nil {
 	connection.WaitOnline(ctx)
-	_, err = s.cl.API.MessagesSendMessage(ctx, req)
+	_, err = s.client.API().MessagesSendMessage(ctx, req)
 	if err != nil {
 		handled := connection.HandleError(err)
 		logger.Errorf("CLI test command: send failed (handled=%t): %v", handled, err)
@@ -491,8 +491,8 @@ func (s *Service) printChannel(id int64, raw *tg.Channel) {
 
 // whoAmI возвращает строку с краткой информацией о текущем аккаунте (имя, username, id).
 // Ошибку получения self оборачивает с контекстом.
-func whoAmI(cl *core.ClientCore) (string, error) {
-	self, err := cl.Client.Self(context.Background())
+func whoAmI(client *telegram.Client) (string, error) {
+	self, err := client.Self(context.Background())
 	if err != nil {
 		return "", fmt.Errorf("failed to get self: %w", err)
 	}

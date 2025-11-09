@@ -21,6 +21,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/infra/telegram/session"
+	"telegram-userbot/internal/support/version"
 
 	contribstorage "github.com/gotd/contrib/storage"
 	"github.com/gotd/td/telegram"
@@ -38,13 +39,12 @@ import (
 //   - маршрутизацию апдейтов и регистрацию доменных обработчиков,
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
-	cl        *core.ClientCore          // Авторизованный клиент gotd и его API-обёртка (Self, вызовы tg).
+	// cl        *telegram.Client          // Авторизованный клиент gotd и его API-обёртка (Self, вызовы tg).
 	filters   *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
 	dupCache  *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).
 	debouncer *concurrency.Debouncer    // Сглаживание бурстов (частые правки одного сообщения и т.п.).
 	handlers  *domainupdates.Handlers   // Доменные обработчики апдейтов и фоновые задачи.
-	dispatch  *tg.UpdateDispatcher      // Маршрутизатор апдейтов gotd: OnNewMessage/OnEdit/etc.
 	runner    *Runner                   // Оркестратор жизненного цикла и CLI.
 	updMgr    *tgupdates.Manager        // Менеджер апдейтов gotd: поток событий и локальное состояние.
 	peers     *peersmgr.Service         // Менеджер пиров + persist storage.
@@ -65,20 +65,13 @@ func NewApp() *App {
 	return &App{}
 }
 
-// Init связывает компоненты приложения и подготавливает их к запуску:
-//  1. создаёт tgupdates.Manager и диспетчер апдейтов,
-//  2. настраивает telegram.Options (сессионное хранилище, хуки, DeviceConfig, DCList),
-//  3. инициализирует MTProto‑клиент, кэш пиров, очередь уведомлений и таймзону,
-//  4. поднимает защиту от дублей и дебаунсер,
-//  5. регистрирует доменные обработчики и конструирует Runner.
-//
-// Возвращает ошибку, если какой-либо этап не удался.
+// Init связывает компоненты приложения и подготавливает их к запуску
 func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	logger.Info("Userbot initializing...")
 
 	a.ctx = ctx
 	a.stop = stop
-	a.dispatch = func(d tg.UpdateDispatcher) *tg.UpdateDispatcher { return &d }(tg.NewUpdateDispatcher())
+	dispatcher := tg.NewUpdateDispatcher()
 	var updateFunc func(context.Context, tg.UpdatesClass) error
 	updateHandlerProxy := telegram.UpdateHandlerFunc(func(handlerCtx context.Context, updates tg.UpdatesClass) error {
 		if updateFunc != nil {
@@ -92,7 +85,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 	// 1) Опции MTProto‑клиента: сессии, хуки апдейтов, поведение при dead‑соединении и паспорт устройства.
 	options := telegram.Options{
-		SessionStorage: &session.NotifyStorage{Path: config.Env().SessionFile},
+		SessionStorage: &session.FileStorage{Path: config.Env().SessionFile},
 		UpdateHandler:  updateHandlerProxy,
 		Middlewares: []telegram.Middleware{
 			updhook.UpdateHook(func(mwCtx context.Context, updates tg.UpdatesClass) error {
@@ -102,13 +95,12 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 		},
 		// При сообщении от gotd о «мертвом» соединении отмечаем отключение для зависимых узлов.
 		OnDead: func() {
-			// logger.Debug("MTProto client reported dead connection, scheduling reconnect")
 			connection.MarkDisconnected()
 		},
 		Device: telegram.DeviceConfig{
 			DeviceModel:   "MacBookPro18,1",
 			SystemVersion: "macOS v15.6.1 build 24G90",
-			AppVersion:    "v5.5.0",
+			AppVersion:    version.Version,
 		},
 		// Logger: logger.Logger().Named("MTProto_Client"),
 	}
@@ -118,14 +110,10 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 		options.DCList = dcs.Test()
 	}
 
-	// 3) Инициализация клиента gotd на основе диспетчера апдейтов и опций.
-	cl, clErr := core.New(a.dispatch, options)
-	if clErr != nil {
-		return fmt.Errorf("init client: %w", clErr)
-	}
-	a.cl = cl
+	// Инициализация клиента gotd
+	client := telegram.NewClient(config.Env().APIID, config.Env().APIHash, options)
 
-	peersSvc, err := peersmgr.New(cl.API, config.Env().PeersCacheFile)
+	peersSvc, err := peersmgr.New(client.API(), config.Env().PeersCacheFile)
 	if err != nil {
 		return fmt.Errorf("init peers manager: %w", err)
 	}
@@ -135,7 +123,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.peers = peersSvc
 
 	updConfig := tgupdates.Config{
-		Handler:      a.dispatch,
+		Handler:      dispatcher,
 		Storage:      core.NewFileStorage(config.Env().StateFile),
 		AccessHasher: peersSvc.Mgr,
 		// Logger:  logger.Logger().Named("Update_Manager"),
@@ -143,7 +131,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.updMgr = tgupdates.New(updConfig)
 	updateFunc = contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store()).Handle
 
-	// Инициализация filters (внутри загружает recipients)
+	// Инициализация filters
 	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
 	if filtersErr := a.filters.Init(); filtersErr != nil {
 		return fmt.Errorf("load filters: %w", filtersErr)
@@ -151,7 +139,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	logger.Infof("Filters loaded: %d total, %d unique chats",
 		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
 
-	// Подсистема уведомлений: файловые сторы для очереди и неудачных отправок.
+	// Подсистема уведомлений
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
 	if err != nil {
 		return fmt.Errorf("init queue store: %w", err)
@@ -171,7 +159,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	var sender notifications.PreparedSender
 	switch config.Env().Notifier {
 	case notifierClient:
-		sender = telegramnotifier.NewClientSender(a.cl.API, config.Env().ThrottleRPS, a.peers)
+		sender = telegramnotifier.NewClientSender(client.API(), config.Env().ThrottleRPS, a.peers)
 	case notifierBot:
 		sender = botapionotifier.NewBotSender(config.Env().BotToken, config.Env().TestDC, config.Env().ThrottleRPS)
 	default:
@@ -198,17 +186,17 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
 
 	// 6) Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
-	h := domainupdates.NewHandlers(cl.API, a.filters, a.notif, a.dupCache, a.debouncer, a.stop, a.peers)
+	h := domainupdates.NewHandlers(client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.stop, a.peers)
 	a.handlers = h
 
 	// Маршрутизация апдейтов на доменные обработчики.
-	a.dispatch.OnNewMessage(h.OnNewMessage)
-	a.dispatch.OnNewChannelMessage(h.OnNewChannelMessage)
-	a.dispatch.OnEditMessage(h.OnEditMessage)
-	a.dispatch.OnEditChannelMessage(h.OnEditChannelMessage)
+	dispatcher.OnNewMessage(h.OnNewMessage)
+	dispatcher.OnNewChannelMessage(h.OnNewChannelMessage)
+	dispatcher.OnEditMessage(h.OnEditMessage)
+	dispatcher.OnEditChannelMessage(h.OnEditChannelMessage)
 
 	// 7) Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
-	a.runner = NewRunner(a.ctx, a.stop, a.cl, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
+	a.runner = NewRunner(a.ctx, a.stop, client, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
 
 	return nil
 }
