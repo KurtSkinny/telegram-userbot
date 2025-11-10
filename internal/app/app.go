@@ -39,7 +39,6 @@ import (
 //   - маршрутизацию апдейтов и регистрацию доменных обработчиков,
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
-	// cl        *telegram.Client          // Авторизованный клиент gotd и его API-обёртка (Self, вызовы tg).
 	filters   *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif     *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
 	dupCache  *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).

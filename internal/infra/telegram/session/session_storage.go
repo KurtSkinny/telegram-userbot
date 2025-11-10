@@ -45,7 +45,7 @@ func (f *FileStorage) LoadSession(_ context.Context) ([]byte, error) {
 
 	data, err := os.ReadFile(f.Path)
 	if os.IsNotExist(err) {
-		return nil, errors.New("session storage: not found")
+		return nil, tdsession.ErrNotFound
 	}
 	if err != nil {
 		return nil, errors.Wrap(err, "read session")
