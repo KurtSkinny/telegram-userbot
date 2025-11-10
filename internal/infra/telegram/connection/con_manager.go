@@ -37,9 +37,9 @@ const (
 	reconnectPingInterval = 10 * time.Second
 	// reconnectPingTimeout задает максимальное время ожидания ответа на RPC-вызов.
 	reconnectPingTimeout = 5 * time.Second
-	// pingAbortedAttempts ограничивает число попыток RPC-вызовов, когда соединение явно закрыто.
-	// После этого монитор перестаёт выполнять RPC-вызовы до следующего MarkDisconnected.
-	pingAbortedAttempts = 10
+	// // pingAbortedAttempts ограничивает число попыток RPC-вызовов, когда соединение явно закрыто.
+	// // После этого монитор перестаёт выполнять RPC-вызовы до следующего MarkDisconnected.
+	// pingAbortedAttempts = 10
 )
 
 var (
@@ -355,10 +355,10 @@ func (m *manager) monitorLoop(ctx context.Context) {
 			// Явно закрытое соединение или умерший движок: считаем «abort» попыткой.
 			case errors.Is(err, net.ErrClosed), errors.Is(err, pool.ErrConnDead), errors.Is(err, rpc.ErrEngineClosed):
 				logger.Debugf("ConnectionMonitor: RPC call aborted, connection closed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
-				if attempt >= pingAbortedAttempts {
-					logger.Debugf("ConnectionMonitor: RPC monitor loop aborted, max attempts (%d) reached", pingAbortedAttempts)
-					return
-				}
+				// if attempt >= pingAbortedAttempts {
+				// 	logger.Debugf("ConnectionMonitor: RPC monitor loop aborted, max attempts (%d) reached", pingAbortedAttempts)
+				// 	return
+				// }
 			case !isNetworkError(err):
 				logger.Errorf("ConnectionMonitor: RPC call failed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
 			default:
@@ -387,7 +387,7 @@ func (m *manager) safeRPCClient(ctx context.Context, client *telegram.Client) (e
 			err = net.ErrClosed
 		}
 	}()
-	
+
 	// Выполняем легковесный RPC-вызов, который требует полноценного MTProto-соединения
 	// и готовности API к работе. Self() является легковесным вызовом,
 	// который проверяет работоспособность соединения и готовность API.
