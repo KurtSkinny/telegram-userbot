@@ -67,7 +67,7 @@ type Service struct {
 	onceStop  sync.Once             // идемпотентная остановка
 }
 
-const refreshDialogsTimeout = 30 * time.Second
+const defaultContextTimeout = 30 * time.Second
 
 // NewService создаёт CLI-сервис. Параметр stopApp используется как «глобальная»
 // остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
@@ -221,7 +221,6 @@ func (s *Service) handleCommand(cmd string) bool {
 		// Перезагружаем фильтры и получателей с rollback при ошибке
 		if err := s.filters.Init(); err != nil {
 			pr.ErrPrintln("reload filters error:", err)
-			return false
 		}
 		pr.Println("recipients.json and filters.json reloaded")
 	case "whoami":
@@ -262,7 +261,7 @@ func (s *Service) handleRefreshDialogs() {
 		pr.ErrPrintln("peers manager is not available")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), refreshDialogsTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
 	defer cancel()
 	if err := s.peers.RefreshDialogs(ctx, s.client.API()); err != nil {
 		pr.ErrPrintln("refresh dialogs error:", err)
