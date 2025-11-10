@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/chzyer/readline v1.5.1
 	github.com/gotd/contrib v0.13.0
-	github.com/gotd/td v0.132.0
+	github.com/gotd/td v0.133.0
 	github.com/joho/godotenv v1.5.1
 	github.com/kr/pretty v0.3.1
 	go.etcd.io/bbolt v1.3.6
@@ -28,7 +28,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gotd/ige v0.2.2 // indirect
 	github.com/gotd/neo v0.1.5 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

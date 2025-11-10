@@ -148,7 +148,7 @@ func (s *Service) run(ctx context.Context) {
 		}
 
 		cmd := strings.TrimSpace(line)
-		if s.handleCommand(cmd) {
+		if s.handleCommand(ctx, cmd) {
 			logger.Debugf("CLI: command %q requested exit", cmd)
 			return
 		}
@@ -208,15 +208,15 @@ func printCommandHelp() {
 
 // handleCommand разбирает введённую команду и выполняет соответствующее действие.
 // Возвращает true, если команда инициирует завершение CLI ("exit").
-func (s *Service) handleCommand(cmd string) bool {
+func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 	switch cmd {
 	case "help":
 		printCommandHelp()
 	case "list":
 		pr.Println("Fetching dialogs...")
-		s.listDialogs()
+		s.listDialogs(ctx)
 	case "refresh dialogs":
-		s.handleRefreshDialogs()
+		s.handleRefreshDialogs(ctx)
 	case "reload":
 		// Перезагружаем фильтры и получателей с rollback при ошибке
 		if err := s.filters.Init(); err != nil {
@@ -224,13 +224,13 @@ func (s *Service) handleCommand(cmd string) bool {
 		}
 		pr.Println("recipients.json and filters.json reloaded")
 	case "whoami":
-		if res, err := whoAmI(s.client); err != nil {
+		if res, err := whoAmI(ctx, s.client); err != nil {
 			pr.ErrPrintln("whoami error:", err)
 		} else {
 			pr.Println(res)
 		}
 	case "test":
-		s.handleTest()
+		s.handleTest(ctx)
 	case "version":
 		pr.ErrPrintln(fmt.Sprintf("%s v%s", versioninfo.Name, versioninfo.Version))
 	case "flush":
@@ -242,7 +242,7 @@ func (s *Service) handleCommand(cmd string) bool {
 			pr.ErrPrintln("queue is not available")
 		}
 	case "status":
-		s.handleStatus()
+		s.handleStatus(ctx)
 	case "exit":
 		if s.stopApp != nil {
 			s.stopApp()
@@ -256,13 +256,12 @@ func (s *Service) handleCommand(cmd string) bool {
 	return false
 }
 
-func (s *Service) handleRefreshDialogs() {
+func (s *Service) handleRefreshDialogs(ctx context.Context) {
 	if s.peers == nil {
 		pr.ErrPrintln("peers manager is not available")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), defaultContextTimeout)
-	defer cancel()
+
 	if err := s.peers.RefreshDialogs(ctx, s.client.API()); err != nil {
 		pr.ErrPrintln("refresh dialogs error:", err)
 		return
@@ -277,7 +276,7 @@ func (s *Service) handleRefreshDialogs() {
 //  3. ждём восстановления соединения (WaitOnline),
 //  4. готовим детерминированный random_id для идемпотентности,
 //  5. отправляем сообщение через MessagesSendMessage.
-func (s *Service) handleTest() {
+func (s *Service) handleTest(ctx context.Context) {
 	logger.Info("CLI test command invoked")
 
 	// const tens = 10
@@ -296,6 +295,7 @@ func (s *Service) handleTest() {
 	// pr.Printf("CLI test command resul: res=%#v, err=%#v\n", res, err)
 
 	status.GoOnline()
+	connection.WaitOnline(ctx)
 
 	adminID := int64(config.Env().AdminUID)
 	if adminID <= 0 {
@@ -310,19 +310,17 @@ func (s *Service) handleTest() {
 		peer tg.InputPeerClass
 		err  error
 	)
-	resolveCtx := context.Background()
+
 	if s.peers == nil {
 		err = errors.New("peers manager is not available")
 	} else {
-		peer, err = s.peers.InputPeerByKind(resolveCtx, notifications.RecipientTypeUser, adminID)
+		peer, err = s.peers.InputPeerByKind(ctx, notifications.RecipientTypeUser, adminID)
 	}
 	if err != nil {
 		logger.Errorf("CLI test command: resolve admin peer failed: %v", err)
 	}
 
 	const ten = 10
-	ctx, cancel := context.WithTimeout(context.Background(), ten*time.Second)
-	defer cancel()
 
 	logger.Info("CLI test command: waiting for connection readiness")
 	connection.WaitOnline(ctx)
@@ -358,7 +356,7 @@ func (s *Service) handleTest() {
 // handleStatus печатает агрегированное состояние очереди уведомлений: размеры, метки времени
 // последнего дренирования и флаша, а также следующего планового тика. Временные метки
 // приводятся к локальной таймзоне, заданной в статистике очереди.
-func (s *Service) handleStatus() {
+func (s *Service) handleStatus(ctx context.Context) {
 	if s.notif == nil {
 		pr.ErrPrintln("queue is not available")
 		return
@@ -379,7 +377,7 @@ func (s *Service) handleStatus() {
 }
 
 // listDialogs выводит офлайн-снимок диалогов без сетевых запросов.
-func (s *Service) listDialogs() {
+func (s *Service) listDialogs(ctx context.Context) {
 	if s.peers == nil {
 		pr.ErrPrintln("peers manager is not available")
 		return
@@ -391,7 +389,6 @@ func (s *Service) listDialogs() {
 		return
 	}
 
-	ctx := context.Background()
 	for _, item := range dialogs {
 		s.printDialog(ctx, item)
 	}
@@ -490,8 +487,8 @@ func (s *Service) printChannel(id int64, raw *tg.Channel) {
 
 // whoAmI возвращает строку с краткой информацией о текущем аккаунте (имя, username, id).
 // Ошибку получения self оборачивает с контекстом.
-func whoAmI(client *telegram.Client) (string, error) {
-	self, err := client.Self(context.Background())
+func whoAmI(ctx context.Context, client *telegram.Client) (string, error) {
+	self, err := client.Self(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get self: %w", err)
 	}

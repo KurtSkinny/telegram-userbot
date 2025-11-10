@@ -2,7 +2,7 @@
 // Он предоставляет глобальный координационный слой для остального кода:
 //   - WaitOnline(ctx) — блокирует до восстановления связи, если клиент офлайн;
 //   - MarkConnected/MarkDisconnected — явные переходы между состояниями;
-//   - мониторинг с периодическими Ping и детекцией сетевых сбоев;
+//   - мониторинг с периодическими RPC-вызовами и детекцией сетевых сбоев;
 //   - безопасная остановка и «генерационный» канал ожидания для снятия гонок.
 //
 // Менеджер потокобезопасен: взаимодействие с ожидателями ведётся через снимки
@@ -32,13 +32,13 @@ import (
 )
 
 const (
-	// reconnectPingInterval определяет период, с которым выполняются пинги
+	// reconnectPingInterval определяет период, с которым выполняются легковесные RPC-вызовы
 	// при ожидании восстановления соединения.
 	reconnectPingInterval = 10 * time.Second
-	// reconnectPingTimeout задает максимальное время ожидания ответа на пинг.
+	// reconnectPingTimeout задает максимальное время ожидания ответа на RPC-вызов.
 	reconnectPingTimeout = 5 * time.Second
-	// pingAbortedAttempts ограничивает число попыток пинга, когда соединение явно закрыто.
-	// После этого монитор перестаёт дёргать Ping до следующего MarkDisconnected.
+	// pingAbortedAttempts ограничивает число попыток RPC-вызовов, когда соединение явно закрыто.
+	// После этого монитор перестаёт выполнять RPC-вызовы до следующего MarkDisconnected.
 	pingAbortedAttempts = 10
 )
 
@@ -68,7 +68,7 @@ func Shutdown() {
 // неблокирующим образом снимает все ожидатели. Доступ к полям защищён мьютексами,
 // признак online хранится в atomic.Bool.
 type manager struct {
-	client *telegram.Client // клиент Telegram, используемый для отправки Ping
+	client *telegram.Client // клиент Telegram, используемый для выполнения RPC-вызовов
 	ctx    context.Context  // базовый контекст жизненного цикла менеджера
 
 	connected atomic.Bool // признак, что клиент в онлайне
@@ -313,12 +313,12 @@ func (m *manager) shutdown() {
 	}
 }
 
-// monitorLoop с периодом reconnectPingInterval пытается отправить Ping. При успехе
-// менеджер переводится в online и цикл завершается. Закрытые/мертвые соединения
+// monitorLoop с периодом reconnectPingInterval пытается выполнить RPC-вызов.
+// При успехе менеджер переводится в online и цикл завершается. Закрытые/мертвые соединения
 // считаются «abort» попытками и ограничены pingAbortedAttempts. Нечёткие сетевые
 // ошибки логируются, контекстная отмена завершает цикл без шума.
 func (m *manager) monitorLoop(ctx context.Context) {
-	// Периодический пинг позволяет выйти из офлайна без внешнего участия.
+	// Периодические RPC-вызовы позволяют выйти из офлайна без внешнего участия.
 	ticker := time.NewTicker(reconnectPingInterval)
 	defer ticker.Stop()
 
@@ -338,13 +338,15 @@ func (m *manager) monitorLoop(ctx context.Context) {
 			// Клиент ещё не присвоен — ждём следующего тика, не паникуем.
 			logger.Debugf("ConnectionMonitor: client is nil, waiting for reconnect (attempt=%d)", attempt)
 		} else {
-			// Пингуем с ограничением по времени, чтобы не зависать на мёртвом соединении.
+			// Выполняем легковесный RPC-вызов с ограничением по времени.
+			// Используем Self(), так как это легковесный вызов, который
+			// требует полноценного MTProto-соединения и готов к работе API.
 			pingCtx, cancel := context.WithTimeout(ctx, reconnectPingTimeout)
-			err := m.safePingClient(pingCtx, client)
+			err := m.safeRPCClient(pingCtx, client)
 			cancel()
 
 			if err == nil {
-				logger.Debugf("ConnectionMonitor: ping ok (attempt=%d, duration=%v)", attempt, time.Since(start))
+				logger.Debugf("ConnectionMonitor: RPC call ok (attempt=%d, duration=%v)", attempt, time.Since(start))
 				m.markConnected()
 				return
 			}
@@ -352,15 +354,15 @@ func (m *manager) monitorLoop(ctx context.Context) {
 			switch {
 			// Явно закрытое соединение или умерший движок: считаем «abort» попыткой.
 			case errors.Is(err, net.ErrClosed), errors.Is(err, pool.ErrConnDead), errors.Is(err, rpc.ErrEngineClosed):
-				logger.Debugf("ConnectionMonitor: ping aborted, connection closed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
+				logger.Debugf("ConnectionMonitor: RPC call aborted, connection closed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
 				if attempt >= pingAbortedAttempts {
-					logger.Debugf("ConnectionMonitor: ping monitor loop aborted, max attempts (%d) reached", pingAbortedAttempts)
+					logger.Debugf("ConnectionMonitor: RPC monitor loop aborted, max attempts (%d) reached", pingAbortedAttempts)
 					return
 				}
 			case !isNetworkError(err):
-				logger.Errorf("ConnectionMonitor: ping failed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
+				logger.Errorf("ConnectionMonitor: RPC call failed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
 			default:
-				logger.Debugf("ConnectionMonitor: ping failed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
+				logger.Debugf("ConnectionMonitor: RPC call failed (attempt=%d, duration=%v): %v", attempt, time.Since(start), err)
 			}
 		}
 
@@ -372,19 +374,27 @@ func (m *manager) monitorLoop(ctx context.Context) {
 	}
 }
 
-// safePingClient оборачивает client.Ping защитой от паник и переводит их в
-// сетевую ошибку (net.ErrClosed). При nil‑клиенте сразу возвращает net.ErrClosed.
-func (m *manager) safePingClient(ctx context.Context, client *telegram.Client) (err error) {
+// safeRPCClient оборачивает легковесный RPC-вызов (Self) защитой от паник
+// и переводит их в сетевую ошибку (net.ErrClosed). При nil‑клиенте сразу возвращает net.ErrClosed.
+// Этот метод проверяет, что MTProto-клиент полностью готов к работе, а не просто пингуется.
+func (m *manager) safeRPCClient(ctx context.Context, client *telegram.Client) (err error) {
 	if client == nil {
 		return net.ErrClosed
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Debugf("ConnectionMonitor: ping panic recovered: %v", r)
+			logger.Debugf("ConnectionMonitor: RPC call panic recovered: %v", r)
 			err = net.ErrClosed
 		}
 	}()
-	err = client.Ping(ctx)
+	
+	// Выполняем легковесный RPC-вызов, который требует полноценного MTProto-соединения
+	// и готовности API к работе. Self() является легковесным вызовом,
+	// который проверяет работоспособность соединения и готовность API.
+	// Используем Self() вместо пинга, потому что он дает лучшую гарантию готовности MTProto-клиента
+	// к выполнению других API-запросов, в отличие от пинга, который может проходить до полной
+	// инициализации MTProto-соединения.
+	_, err = client.Self(ctx)
 	return err
 }
 
