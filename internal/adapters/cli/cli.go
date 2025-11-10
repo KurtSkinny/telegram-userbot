@@ -7,10 +7,10 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"telegram-userbot/internal/domain/filters"
@@ -56,15 +56,16 @@ var (
 // и синхронно закрывается через Stop(). Потокобезопасность обеспечивается
 // дисциплиной запуска/остановки и отсутствием внешних мутаций.
 type Service struct {
-	client    *telegram.Client      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
-	stopApp   context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
-	filters   *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
-	notif     *notifications.Queue  // очередь уведомлений; нужна для flush/status
-	peers     *peersmgr.Service     // peers-кэш, предоставляет офлайн-данные по диалогам
-	cancel    context.CancelFunc    // локальная отмена run-цикла CLI
-	wg        sync.WaitGroup        // ожидание завершения фоновой горутины run
-	onceStart sync.Once             // идемпотентный запуск
-	onceStop  sync.Once             // идемпотентная остановка
+	client      *telegram.Client      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
+	stopApp     context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
+	filters     *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
+	notif       *notifications.Queue  // очередь уведомлений; нужна для flush/status
+	peers       *peersmgr.Service     // peers-кэш, предоставляет офлайн-данные по диалогам
+	cancel      context.CancelFunc    // локальная отмена run-цикла CLI
+	wg          sync.WaitGroup        // ожидание завершения фоновой горутины run
+	onceStart   sync.Once             // идемпотентный запуск
+	onceStop    sync.Once             // идемпотентная остановка
+	testRunning int64                 // флаг, указывающий, выполняется ли команда test в данный момент (0 - нет, 1 - да)
 }
 
 const defaultContextTimeout = 30 * time.Second
@@ -230,7 +231,7 @@ func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 			pr.Println(res)
 		}
 	case "test":
-		s.handleTest(ctx)
+		s.handleTestAsync(ctx)
 	case "version":
 		pr.ErrPrintln(fmt.Sprintf("%s v%s", versioninfo.Name, versioninfo.Version))
 	case "flush":
@@ -242,7 +243,7 @@ func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 			pr.ErrPrintln("queue is not available")
 		}
 	case "status":
-		s.handleStatus(ctx)
+		s.handleStatus()
 	case "exit":
 		if s.stopApp != nil {
 			s.stopApp()
@@ -269,6 +270,28 @@ func (s *Service) handleRefreshDialogs(ctx context.Context) {
 	pr.Println("Dialogs cache refreshed.")
 }
 
+// handleTestAsync запускает тестовую команду в отдельной горутине, если она не выполняется в данный момент.
+func (s *Service) handleTestAsync(ctx context.Context) {
+	// Проверяем, не выполняется ли уже команда test
+	if !atomic.CompareAndSwapInt64(&s.testRunning, 0, 1) {
+		pr.Println("Test command is already running, please wait...")
+		return
+	}
+
+	// Запускаем выполнение в отдельной горутине
+	go func() {
+		// Гарантируем сброс флага при завершении
+		defer atomic.StoreInt64(&s.testRunning, 0)
+
+		// Создаем таймаут-контекст для выполнения команды
+		const timeout = 100 * time.Second
+		testCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		s.handleTest(testCtx)
+	}()
+}
+
 // handleTest отправляет тестовое сообщение админу, чтобы проверить связность.
 // Логика:
 //  1. переводим статус в online (status.GoOnline),
@@ -279,23 +302,10 @@ func (s *Service) handleRefreshDialogs(ctx context.Context) {
 func (s *Service) handleTest(ctx context.Context) {
 	logger.Info("CLI test command invoked")
 
-	// const tens = 10
-	// ctx, cancel := context.WithTimeout(context.Background(), tens*time.Second)
-	// defer cancel()
-
-	// adminID := int64(config.Env().AdminUID)
-	// if err != nil {
-	// 	logger.Errorf("CLI test command: resolve admin peer failed: %v", err)
-	// }
-	// res, err := s.cl.API.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
-	// 	Peer:   peer,
-	// 	Action: &tg.SendMessageTypingAction{},
-	// })
-	// connection.HandleError(err)
-	// pr.Printf("CLI test command resul: res=%#v, err=%#v\n", res, err)
-
-	status.GoOnline()
-	connection.WaitOnline(ctx)
+	if s.peers == nil {
+		logger.Error("peers manager is not available")
+		return
+	}
 
 	adminID := int64(config.Env().AdminUID)
 	if adminID <= 0 {
@@ -304,50 +314,69 @@ func (s *Service) handleTest(ctx context.Context) {
 
 	currentTime := time.Now().Format(time.RFC3339)
 	message := fmt.Sprintf("Test message from CLI at %s", currentTime)
-	logger.Infof("CLI test command: preparing message for admin %d", adminID)
 
-	var (
-		peer tg.InputPeerClass
-		err  error
-	)
+	// Пытаемся отправить сообщение с повторными попытками при сетевых ошибках
+	const maxRetries = 3
+	var lastErr error
 
-	if s.peers == nil {
-		err = errors.New("peers manager is not available")
-	} else {
-		peer, err = s.peers.InputPeerByKind(ctx, notifications.RecipientTypeUser, adminID)
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		connection.WaitOnline(ctx)
+		status.GoOnline()
+
+		peer, errPeer := s.peers.InputPeerByKind(ctx, notifications.RecipientTypeUser, adminID)
+		if errPeer != nil {
+			logger.Errorf("CLI test command: resolve admin peer failed: %v", errPeer)
+			return
+		}
+
+		// Формируем получателя в терминах доменной модели уведомлений.
+		recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
+		job := notifications.Job{
+			ID:        time.Now().UnixNano(),
+			CreatedAt: time.Now(),
+		}
+		randomID := notifications.RandomIDForMessage(job, recipient)
+
+		// Готовим запрос отправки сообщения. Текст простой, без entities.
+		req := &tg.MessagesSendMessageRequest{
+			Peer:     peer,
+			Message:  message,
+			RandomID: randomID,
+		}
+
+		_, apiErr := s.client.API().MessagesSendMessage(ctx, req)
+		if apiErr == nil {
+			logger.Infof("CLI test command: message sent successfully after %d attempt(s)", attempt)
+			lastErr = nil
+			break
+		} else {
+			lastErr = apiErr
+		}
+
+		// Проверяем, является ли ошибка сетевой
+		handled := connection.HandleError(apiErr)
+
+		if handled {
+			// Это сетевая ошибка, ожидаем восстановления соединения
+			logger.Infof("CLI test command: network error occurred (attempt %d), waiting for connection: %v",
+				attempt, apiErr)
+			// connection.WaitOnline уже внутри вызова, но в случае сетевой ошибки
+			// может потребоваться дополнительное ожидание
+			if attempt < maxRetries {
+				// Краткая пауза перед повторной попыткой
+				select {
+				case <-time.After(time.Second):
+				case <-ctx.Done():
+					logger.Info("CLI test command: context cancelled during retry delay")
+					return
+				}
+				continue
+			}
+		}
 	}
-	if err != nil {
-		logger.Errorf("CLI test command: resolve admin peer failed: %v", err)
-	}
 
-	const ten = 10
-
-	logger.Info("CLI test command: waiting for connection readiness")
-	connection.WaitOnline(ctx)
-
-	// Формируем получателя в терминах доменной модели уведомлений.
-	recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
-	job := notifications.Job{
-		ID:        time.Now().UnixNano(),
-		CreatedAt: time.Now(),
-	}
-	randomID := notifications.RandomIDForMessage(job, recipient)
-
-	// Готовим запрос отправки сообщения. Текст простой, без entities.
-	req := &tg.MessagesSendMessageRequest{
-		Peer:     peer,
-		Message:  message,
-		RandomID: randomID,
-	}
-
-	logger.Infof("CLI test command: sending message \"%s\"", message)
-
-	// if err := s.notif.Send(ctx, adminID, message); err != nil {
-	connection.WaitOnline(ctx)
-	_, err = s.client.API().MessagesSendMessage(ctx, req)
-	if err != nil {
-		handled := connection.HandleError(err)
-		logger.Errorf("CLI test command: send failed (handled=%t): %v", handled, err)
+	if lastErr != nil {
+		logger.Errorf("CLI test command: all attempts failed, final error: %v", lastErr)
 	}
 
 	logger.Info("CLI test command: complited")
@@ -356,7 +385,7 @@ func (s *Service) handleTest(ctx context.Context) {
 // handleStatus печатает агрегированное состояние очереди уведомлений: размеры, метки времени
 // последнего дренирования и флаша, а также следующего планового тика. Временные метки
 // приводятся к локальной таймзоне, заданной в статистике очереди.
-func (s *Service) handleStatus(ctx context.Context) {
+func (s *Service) handleStatus() {
 	if s.notif == nil {
 		pr.ErrPrintln("queue is not available")
 		return
