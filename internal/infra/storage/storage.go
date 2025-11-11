@@ -15,9 +15,9 @@ import (
 	"telegram-userbot/internal/infra/logger"
 )
 
-// defaultFilePerm — права, выставляемые на итоговый файл при атомарной записи.
+// DefaultFilePerm — права, выставляемые на итоговый файл при атомарной записи.
 // Значение 0o600 ограничивает доступ только владельцу процесса.
-const defaultFilePerm = 0600
+const DefaultFilePerm = 0600
 
 // EnsureDir гарантирует наличие каталога для указанного файла.
 // Если путь не содержит директорию ("." или пустая строка), ничего не делает.
@@ -72,7 +72,7 @@ func AtomicWriteFile(path string, data []byte) error {
 		return fmt.Errorf("fsync temp file: %w", err)
 	}
 	// Выставляем права для будущего целевого файла.
-	if err := tmp.Chmod(defaultFilePerm); err != nil {
+	if err := tmp.Chmod(DefaultFilePerm); err != nil {
 		// Не критично, но лучше не скрывать проблему прав.
 		_ = tmp.Close()
 		return fmt.Errorf("chmod temp file: %w", err)

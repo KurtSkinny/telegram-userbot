@@ -5,12 +5,10 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	botapionotifier "telegram-userbot/internal/adapters/botapi/notifier"
-	"telegram-userbot/internal/adapters/telegram/core"
 	telegramnotifier "telegram-userbot/internal/adapters/telegram/notifier"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
@@ -18,11 +16,16 @@ import (
 	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
+	"telegram-userbot/internal/infra/storage"
 	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/infra/telegram/session"
 	"telegram-userbot/internal/support/version"
 
+	"github.com/go-faster/errors"
+	"go.etcd.io/bbolt"
+
+	boltstor "github.com/gotd/contrib/bbolt"
 	contribstorage "github.com/gotd/contrib/storage"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
@@ -112,18 +115,29 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	// Инициализация клиента gotd
 	client := telegram.NewClient(config.Env().APIID, config.Env().APIHash, options)
 
-	peersSvc, err := peersmgr.New(client.API(), config.Env().PeersCacheFile)
-	if err != nil {
-		return fmt.Errorf("init peers manager: %w", err)
+	peersSvc, peersMgrErr := peersmgr.New(client.API(), config.Env().PeersCacheFile)
+	if peersMgrErr != nil {
+		return fmt.Errorf("init peers manager: %w", peersMgrErr)
 	}
-	if err = peersSvc.LoadFromStorage(ctx); err != nil {
+	if err := peersSvc.LoadFromStorage(ctx); err != nil {
 		return fmt.Errorf("load peers storage: %w", err)
 	}
 	a.peers = peersSvc
 
+	// Инициализация хранилища состояния апдейтов
+	if err := storage.EnsureDir(config.Env().StateFile); err != nil {
+		return fmt.Errorf("ensure state file dir: %w", err)
+	}
+	stateStorageBoltdb, err := bbolt.Open(config.Env().StateFile, storage.DefaultFilePerm, nil)
+	if err != nil {
+		return errors.Wrap(err, "create bolt storage")
+	}
+	stateStorage := boltstor.NewStateStorage(stateStorageBoltdb)
+
+	// Инициализация менеджера апдейтов
 	updConfig := tgupdates.Config{
 		Handler:      dispatcher,
-		Storage:      core.NewFileStorage(config.Env().StateFile),
+		Storage:      stateStorage,
 		AccessHasher: peersSvc.Mgr,
 		// Logger:  logger.Logger().Named("Update_Manager"),
 	}
@@ -180,11 +194,11 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	}
 	a.notif = queue
 
-	// 5) Защита от дублей и бурстов правок.
+	// Защита от дублей и бурстов правок.
 	a.dupCache = concurrency.NewDeduplicator(config.Env().DedupWindowSec)
 	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
 
-	// 6) Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
+	// Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
 	h := domainupdates.NewHandlers(client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.stop, a.peers)
 	a.handlers = h
 
@@ -194,7 +208,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	dispatcher.OnEditMessage(h.OnEditMessage)
 	dispatcher.OnEditChannelMessage(h.OnEditChannelMessage)
 
-	// 7) Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
+	// Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
 	a.runner = NewRunner(a.ctx, a.stop, client, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
 
 	return nil
