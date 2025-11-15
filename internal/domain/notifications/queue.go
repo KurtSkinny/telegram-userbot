@@ -29,9 +29,6 @@ import (
 // элементов уже требует внимания, но при этом не критично для памяти.
 const warnIfLargeSize = 1000
 
-// scheduleKeyResolution определяет гранулярность дедупликации триггеров расписания
-const scheduleKeyResolution = time.Minute
-
 // PreparedSender — транспорт доставки подготовленных заданий очереди.
 // Реализации обязаны обеспечивать идемпотентность (не повторять уже доставленное),
 // разумный троттлинг и стратегию ретраев. Опционально могут реализовывать
@@ -46,7 +43,7 @@ type PreparedSender interface {
 //   - NetworkDown — транспорт сообщил об оффлайне; очередь приостановит дренирование и подождёт online;
 //   - Retry — рекомендовано повторить попытку позднее (например, 429).
 type SendOutcome struct {
-	PermanentFailures []Recipient
+	PermanentFailures []filters.Recipient
 	PermanentError    error
 	NetworkDown       bool
 	Retry             bool
@@ -116,9 +113,6 @@ type Queue struct {
 
 	now     func() time.Time
 	runOnce sync.Once
-
-	// lastScheduledKey хранит ключ последнего триггера расписания (UTC, усечённый до минуты)
-	lastScheduledKey int64
 }
 
 // NewQueue восстанавливает состояние из хранилища, парсит расписание, подготавливает каналы и зависимости.
@@ -163,7 +157,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 	validRegular := []Job{}
 
 	for _, job := range state.Urgent {
-		if job.Recipient.Type == "" || job.Recipient.ID == 0 {
+		if job.Recipient.Type == "" || job.Recipient.PeerID == 0 {
 			logger.Errorf("Queue: skipping invalid urgent job %d (empty recipient)", job.ID)
 			continue
 		}
@@ -171,7 +165,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 	}
 
 	for _, job := range state.Regular {
-		if job.Recipient.Type == "" || job.Recipient.ID == 0 {
+		if job.Recipient.Type == "" || job.Recipient.PeerID == 0 {
 			logger.Errorf("Queue: skipping invalid regular job %d (empty recipient)", job.ID)
 			continue
 		}
@@ -293,56 +287,42 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	// Создаем Job'ы
+	// Создаем Job'ы напрямую с filters.Recipient - вся информация уже есть
 	for _, r := range fres.Recipients {
 		job := Job{
-			Urgent: fres.Filter.Notify.Urgent,
-			Recipient: Recipient{
-				Type: string(r.Type),
-				ID:   int64(r.PeerID),
-			},
-			Payload: payload,
+			Urgent:    fres.Filter.Notify.Urgent,
+			Recipient: r, // Используем полный filters.Recipient с TZ и Schedule
+			Payload:   payload,
 		}
 		jobID := q.enqueue(job)
 		logger.Debugf(
 			"Queue: job %d enqueued (filter=%s urgent=%t recipient=%s:%d)",
-			jobID, fres.Filter.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
+			jobID, fres.Filter.ID, job.Urgent, job.Recipient.Type, job.Recipient.PeerID)
 	}
 
-	return nil
-}
-
-// Send ставит срочное задание на доставку произвольного текста конкретному пользователю.
-func (q *Queue) Send(ctx context.Context, uid int64, text string) error {
-	// Контекст не используется внутри: постановка выполняется синхронно и мгновенно.
-	// Сохраняем подпись для совместимости с существующими вызовами.
-	_ = ctx
-
-	job := Job{
-		Urgent: true,
-		Recipient: Recipient{
-			Type: RecipientTypeUser,
-			ID:   uid,
-		},
-		Payload: Payload{
-			Text: strings.TrimSpace(text),
-		},
-	}
-
-	jobID := q.enqueue(job)
-	logger.Debugf("Queue: direct job %d enqueued for user %d", jobID, uid)
 	return nil
 }
 
 // enqueue присваивает job ID, сохраняет его в нужную очередь и планирует персист в фоне.
 // Возвращает присвоенный идентификатор. Для urgent дополнительно сигналит воркеру.
+// Теперь использует job.Recipient.CalculateScheduledTime() для персонального планирования.
 func (q *Queue) enqueue(job Job) int64 {
 	urgent := job.Urgent
+	now := q.now()
 
 	q.mu.Lock()
 
 	job.ID = q.state.NextID
-	job.CreatedAt = q.now().UTC()
+	job.CreatedAt = now.UTC()
+
+	// Вычисляем время отправки с учетом персональных настроек получателя
+	// Конвертируем глобальное schedule в строки для совместимости
+	defaultSchedule := make([]string, len(q.schedule))
+	for i, entry := range q.schedule {
+		defaultSchedule[i] = fmt.Sprintf("%02d:%02d", entry.hour, entry.minute)
+	}
+	job.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, now, q.location, defaultSchedule)
+
 	q.state.NextID++
 
 	if job.Urgent {
@@ -356,6 +336,10 @@ func (q *Queue) enqueue(job Job) int64 {
 	regularLen := len(q.state.Regular)
 	q.persistLocked()
 	q.mu.Unlock()
+
+	logger.Debugf("Queue: job %d scheduled for %s (recipient=%s:%d, urgent=%t, tz=%s)",
+		jobID, job.ScheduledAt.Format(time.RFC3339), job.Recipient.Type, job.Recipient.PeerID,
+		job.Urgent, job.Recipient.TZ)
 
 	q.warnIfLarge(urgentLen, regularLen)
 
@@ -427,40 +411,41 @@ func (q *Queue) workerLoop() {
 	}
 }
 
-// triggerScheduledWindow дедуплицирует сигналы расписания по минутному окну и сигналит drain один раз за окно.
-func (q *Queue) triggerScheduledWindow(win time.Time) {
-	// Ключ окна: UTC, усечён до минутной гранулярности
-	key := win.UTC().Truncate(scheduleKeyResolution).Unix()
-
+// checkScheduledJobs проверяет регулярную очередь на наличие заданий, готовых к отправке.
+// Если находит готовые задания, инициирует дренирование регулярной очереди.
+func (q *Queue) checkScheduledJobs(now time.Time) {
 	q.mu.Lock()
-	if q.lastScheduledKey == key {
-		q.mu.Unlock()
-		return // Уже триггерили это окно — выходим без повторного сигнала/лога
+	hasReadyJobs := false
+	readyCount := 0
+
+	// Проверяем регулярные задания на готовность к отправке
+	for _, job := range q.state.Regular {
+		if !job.ScheduledAt.After(now) {
+			hasReadyJobs = true
+			readyCount++
+		}
 	}
-	q.lastScheduledKey = key
 	q.mu.Unlock()
 
-	logger.Debugf("Queue: schedule tick at %s", win.In(q.location).Format(time.RFC3339))
-	q.signalRegularDrain("scheduled window")
+	if hasReadyJobs {
+		logger.Debugf("Queue: found %d scheduled jobs ready at %s",
+			readyCount, now.Format(time.RFC3339))
+		q.signalRegularDrain("scheduled jobs ready")
+	}
 }
 
-// schedulerLoop ждёт наступления ближайшего слота расписания и триггерит дренирование.
+// schedulerLoop запускается каждую минуту и проверяет, есть ли задания готовые к отправке.
+// Заменяет старую логику расписания на персональную проверку времени отправки каждого задания.
 func (q *Queue) schedulerLoop() {
-	for {
-		nextTick := q.nextScheduleAfter(q.now())
-		// delay может быть отрицательным, если nextTick < now (например, при пропущенном слоте).
-		delay := time.Until(nextTick)
-		delay = max(delay, 0)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 
-		timer := time.NewTimer(delay)
+	for {
 		select {
 		case <-q.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
 			return
-		case <-timer.C:
-			q.triggerScheduledWindow(nextTick)
+		case now := <-ticker.C:
+			q.checkScheduledJobs(now)
 		}
 	}
 }
@@ -564,7 +549,7 @@ func (q *Queue) processRegular(sig drainSignal) {
 func (q *Queue) handleJob(job Job) bool {
 	start := q.now()
 	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)",
-		job.ID, job.Urgent, job.Recipient.Type, job.Recipient.ID)
+		job.ID, job.Urgent, job.Recipient.Type, job.Recipient.PeerID)
 
 	ctx := q.ctx
 	result, err := q.sender.Deliver(ctx, job)
@@ -614,7 +599,7 @@ func (q *Queue) handleJob(job Job) bool {
 		}
 		logger.Errorf(
 			"Queue: job %d permanent failure for recipient %s:%d: %s",
-			job.ID, job.Recipient.Type, job.Recipient.ID, errMsg)
+			job.ID, job.Recipient.Type, job.Recipient.PeerID, errMsg)
 	}
 
 	duration := time.Since(start)
@@ -623,6 +608,7 @@ func (q *Queue) handleJob(job Job) bool {
 }
 
 // requeueJob возвращает задание обратно в соответствующую очередь. front=true — поставить в начало.
+// Для регулярных заданий пересчитывает ScheduledAt, чтобы избежать повторной немедленной отправки.
 func (q *Queue) requeueJob(job Job, front bool) {
 	q.mu.Lock()
 
@@ -631,11 +617,28 @@ func (q *Queue) requeueJob(job Job, front bool) {
 		state = &q.state.Urgent
 	}
 
+	clone := job.Clone()
+
+	// Для регулярных заданий пересчитываем время отправки, чтобы избежать немедленного повтора
+	if !job.Urgent {
+		// Создаем пустого получателя для fallback на дефолтные настройки
+		emptyRecipient := filters.Recipient{}
+
+		// Конвертируем глобальное schedule в строки
+		defaultSchedule := make([]string, len(q.schedule))
+		for i, entry := range q.schedule {
+			defaultSchedule[i] = fmt.Sprintf("%02d:%02d", entry.hour, entry.minute)
+		}
+
+		clone.ScheduledAt = emptyRecipient.CalculateScheduledTime(job.Urgent, q.now(), q.location, defaultSchedule)
+		logger.Debugf("Queue: job %d rescheduled for %s due to requeue (using default schedule)",
+			clone.ID, clone.ScheduledAt.Format(time.RFC3339))
+	}
+
 	if front {
-		clone := job.Clone()
 		*state = append([]Job{clone}, *state...)
 	} else {
-		*state = append(*state, job.Clone())
+		*state = append(*state, clone)
 	}
 
 	q.persistLocked()
@@ -662,18 +665,26 @@ func (q *Queue) popUrgent() (Job, bool) {
 	return job, true
 }
 
-// popRegular снимает первое регулярное задание, обновляет состояние и планирует persist.
+// popRegular снимает первое готовое к отправке регулярное задание, обновляет состояние и планирует persist.
+// Теперь проверяет ScheduledAt и возвращает задание только если время отправки наступило.
 func (q *Queue) popRegular() (Job, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if len(q.state.Regular) == 0 {
-		return Job{}, false
+	now := q.now()
+
+	// Ищем первое готовое к отправке задание
+	for i, job := range q.state.Regular {
+		if !job.ScheduledAt.After(now) {
+			// Задание готово к отправке - удаляем из очереди
+			q.state.Regular = append(q.state.Regular[:i], q.state.Regular[i+1:]...)
+			q.persistLocked()
+			return job, true
+		}
 	}
-	job := q.state.Regular[0]
-	q.state.Regular = q.state.Regular[1:]
-	q.persistLocked()
-	return job, true
+
+	// Нет готовых заданий
+	return Job{}, false
 }
 
 // persistLocked помечает время последней синхронизации и планирует запись состояния (без блокировки диска здесь).
@@ -767,17 +778,26 @@ func buildForwardSpec(msg *tg.Message) (*ForwardSpec, error) {
 	}, nil
 }
 
-// peerToRecipient преобразует tg.PeerClass в доменную сущность Recipient.
-func peerToRecipient(peer tg.PeerClass) (Recipient, error) {
+// peerToRecipient преобразует tg.PeerClass в доменную сущность filters.Recipient.
+func peerToRecipient(peer tg.PeerClass) (filters.Recipient, error) {
 	switch v := peer.(type) {
 	case *tg.PeerUser:
-		return Recipient{Type: RecipientTypeUser, ID: v.UserID}, nil
+		return filters.Recipient{
+			Type:   filters.RecipientTypeUser,
+			PeerID: filters.RecipientPeerID(v.UserID),
+		}, nil
 	case *tg.PeerChat:
-		return Recipient{Type: RecipientTypeChat, ID: v.ChatID}, nil
+		return filters.Recipient{
+			Type:   filters.RecipientTypeChat,
+			PeerID: filters.RecipientPeerID(v.ChatID),
+		}, nil
 	case *tg.PeerChannel:
-		return Recipient{Type: RecipientTypeChannel, ID: v.ChannelID}, nil
+		return filters.Recipient{
+			Type:   filters.RecipientTypeChannel,
+			PeerID: filters.RecipientPeerID(v.ChannelID),
+		}, nil
 	default:
-		return Recipient{}, fmt.Errorf("unsupported peer type %T", peer)
+		return filters.Recipient{}, fmt.Errorf("unsupported peer type %T", peer)
 	}
 }
 

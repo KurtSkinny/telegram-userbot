@@ -230,24 +230,24 @@ func (s *Service) InputPeerFromMessage(ctx context.Context, msg *tg.Message) (tg
 }
 
 // InputPeerByKind подбирает tg.InputPeerClass по строковому типу и идентификатору.
-func (s *Service) InputPeerByKind(ctx context.Context, kind string, id int64) (tg.InputPeerClass, error) {
+func (s *Service) InputPeerByKind(ctx context.Context, kind string, peerID int64) (tg.InputPeerClass, error) {
 	switch kind {
 	case "user":
-		user, err := s.Mgr.ResolveUserID(ctx, id)
+		user, err := s.Mgr.ResolveUserID(ctx, peerID)
 		if err != nil {
-			return nil, fmt.Errorf("resolve user %d: %w", id, err)
+			return nil, fmt.Errorf("resolve user %d: %w", peerID, err)
 		}
 		return user.InputPeer(), nil
 	case "chat":
-		chat, err := s.Mgr.ResolveChatID(ctx, id)
+		chat, err := s.Mgr.ResolveChatID(ctx, peerID)
 		if err != nil {
-			return nil, fmt.Errorf("resolve chat %d: %w", id, err)
+			return nil, fmt.Errorf("resolve chat %d: %w", peerID, err)
 		}
 		return chat.InputPeer(), nil
 	case "channel":
-		channel, err := s.Mgr.ResolveChannelID(ctx, id)
+		channel, err := s.Mgr.ResolveChannelID(ctx, peerID)
 		if err != nil {
-			return nil, fmt.Errorf("resolve channel %d: %w", id, err)
+			return nil, fmt.Errorf("resolve channel %d: %w", peerID, err)
 		}
 		return channel.InputPeer(), nil
 	default:
@@ -310,24 +310,6 @@ func (s *Service) RefreshDialogs(ctx context.Context, api *tg.Client) error {
 		return fmt.Errorf("peersmgr: persist dialogs snapshot: %w", err)
 	}
 	return nil
-}
-
-func (s *Service) iterateStoredPeers(ctx context.Context) (contribstorage.PeerIterator, bool, error) {
-	exists := false
-	if err := s.db.View(func(tx *bbolt.Tx) error {
-		exists = tx.Bucket(peersBucketBytes) != nil
-		return nil
-	}); err != nil {
-		return nil, false, err
-	}
-	if !exists {
-		return nil, false, nil
-	}
-	iter, err := s.store.Iterate(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	return iter, true, nil
 }
 
 func (s *Service) loadDialogsSnapshot() error {

@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 )
 
@@ -70,30 +71,29 @@ func NewBotSender(token string, testDC bool, rps int) *BotSender {
 	}
 }
 
-
-
 // toBotChatID конвертирует доменного получателя в корректный chat_id для Bot API.
 // Пользователь → положительный id. Basic group → отрицательный id.
 // Канал/супергруппа → -100<id>. Функция не валидирует существование чата.
-func toBotChatID(r notifications.Recipient) int64 {
+func toBotChatID(r filters.Recipient) int64 {
+	peerID := int64(r.PeerID)
 	switch r.Type {
-	case notifications.RecipientTypeUser:
-		if r.ID < 0 {
-			return -r.ID
+	case filters.RecipientTypeUser:
+		if peerID < 0 {
+			return -peerID
 		}
-		return r.ID
-	case notifications.RecipientTypeChat:
-		if r.ID > 0 {
-			return -r.ID
+		return peerID
+	case filters.RecipientTypeChat:
+		if peerID > 0 {
+			return -peerID
 		}
-		return r.ID
-	case notifications.RecipientTypeChannel:
-		if r.ID > 0 {
-			return botSuperPrefix - r.ID
+		return peerID
+	case filters.RecipientTypeChannel:
+		if peerID > 0 {
+			return botSuperPrefix - peerID
 		}
-		return r.ID
+		return peerID
 	default:
-		return r.ID
+		return peerID
 	}
 }
 
@@ -308,44 +308,6 @@ func handleJSONResponse(body []byte) (bool, error) {
 	return false, fmt.Errorf("bot api error %d: %s", apiResp.ErrorCode, msg)
 }
 
-// parseRetryAfterHeader парсит Retry-After из заголовка: либо число секунд, либо абсолютную дату.
-// Возвращает 0, если значение отсутствует или некорректно.
-func parseRetryAfterHeader(value string) time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0
-	}
-
-	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
-		return time.Duration(seconds) * time.Second
-	}
-
-	if ts, err := http.ParseTime(value); err == nil {
-		delta := time.Until(ts)
-		if delta > 0 {
-			return delta
-		}
-	}
-
-	return 0
-}
-
-// parseRetryAfterBody извлекает parameters.retry_after из JSON тела. Нулевое или отрицательное — как отсутствие.
-func parseRetryAfterBody(body []byte) time.Duration {
-	var payload struct {
-		Parameters struct {
-			RetryAfter int `json:"retry_after"`
-		} `json:"parameters"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0
-	}
-	if payload.Parameters.RetryAfter <= 0 {
-		return 0
-	}
-	return time.Duration(payload.Parameters.RetryAfter) * time.Second
-}
-
 // isPermanentBotError анализирует JSON-ответ Bot API: большинство 4xx — постоянные ошибки,
 // но retry_after сигнализирует о временном сбое. Проверка остаётся на случай нестандартных сообщений.
 func isPermanentBotError(code int, desc string) bool {
@@ -358,5 +320,3 @@ func isPermanentBotError(code int, desc string) bool {
 	}
 	return code >= 400 && code < 500
 }
-
-

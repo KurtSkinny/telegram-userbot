@@ -7,6 +7,8 @@ package notifications
 import (
 	"encoding/binary"
 	"hash/fnv"
+
+	"telegram-userbot/internal/domain/filters"
 )
 
 const (
@@ -20,12 +22,12 @@ const (
 // Вход включает jobID и тип/ID получателя.
 // Это гарантирует устойчивость к ретраям и отсутствие дублей в пределах адресата.
 // Важно: уникальность обеспечивается на уровне комбинации (jobID, recipient).
-func RandomIDForMessage(job Job, recipient Recipient) int64 {
+func RandomIDForMessage(job Job, recipient filters.Recipient) int64 {
 	return randomIDFromParts(
 		uint64(job.ID),                   // #nosec G115
 		uint64(job.CreatedAt.UnixNano()), // #nosec G115
-		recipientTypeKey(recipient.Type),
-		uint64(recipient.ID), // #nosec G115
+		recipientTypeKey(recipient.Type.String()),
+		uint64(recipient.PeerID), // #nosec G115
 	)
 }
 
@@ -33,18 +35,18 @@ func RandomIDForMessage(job Job, recipient Recipient) int64 {
 // Хэш смешивает jobID, тип/ID получателя, тип/ID источника и сами message_id.
 // Дополнительно учитывается позиция i, чтобы различать сообщения с одинаковыми ID в разных позициях.
 // Таким образом Telegram будет дедуплицировать ретраи, но не склеивать разные элементы батча.
-func RandomIDsForForward(job Job, recipient Recipient, from Recipient, messageIDs []int) []int64 {
+func RandomIDsForForward(job Job, recipient filters.Recipient, from filters.Recipient, messageIDs []int) []int64 {
 	out := make([]int64, len(messageIDs))
 	for i, messageID := range messageIDs {
 		out[i] = randomIDFromParts(
 			uint64(job.ID),                   // #nosec G115
 			uint64(job.CreatedAt.UnixNano()), // #nosec G115
-			recipientTypeKey(recipient.Type),
-			uint64(recipient.ID),            // #nosec G115
-			recipientTypeKey(from.Type)+100, //nolint: mnd // так надо
-			uint64(from.ID),                 // #nosec G115
-			uint64(messageID),               // #nosec G115
-			uint64(i),                       // #nosec G115
+			recipientTypeKey(recipient.Type.String()),
+			uint64(recipient.PeerID),                 // #nosec G115
+			recipientTypeKey(from.Type.String())+100, //nolint: mnd // так надо
+			uint64(from.PeerID),                      // #nosec G115
+			uint64(messageID),                        // #nosec G115
+			uint64(i),                                // #nosec G115
 		)
 	}
 	return out
@@ -73,14 +75,14 @@ func randomIDFromParts(parts ...uint64) int64 {
 // Значения фиксированы: user=1, chat=2, channel=3; 0 — для неизвестного.
 func recipientTypeKey(t string) uint64 {
 	switch t {
-	case RecipientTypeUser:
+	case string(filters.RecipientTypeUser):
 		// Значение 1 соответствует пользователям. Используем небольшие натуральные числа,
 		// чтобы различия типов влияли на итоговый hash, но не требовали дополнительной памяти.
 		return 1
-	case RecipientTypeChat:
+	case string(filters.RecipientTypeChat):
 		// Значение 2 выбрано для групповых чатов. Главное — уникальность относительно user/channel.
 		return 2 //nolint: mnd // так надо
-	case RecipientTypeChannel:
+	case string(filters.RecipientTypeChannel):
 		// Значение 3 назначено каналам и мегагруппам. Этого хватает, чтобы тип peer участвовал в hash.
 		return 3 //nolint: mnd // так надо
 	default:

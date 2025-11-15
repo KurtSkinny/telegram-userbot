@@ -5,33 +5,19 @@
 
 package notifications
 
-import "time"
+import (
+	"time"
 
-// Recipient описывает получателя уведомления: тип peer и его числовой идентификатор.
-// Тип хранится как человекочитаемая строка (user/chat/channel), чтобы JSON был стабилен,
-// а транспорт мог по ней выбрать корректный способ резолва InputPeer.
-type Recipient struct {
-	Type string `json:"type"`
-	ID   int64  `json:"id"`
-}
-
-// Типы получателей. Держим строковые метки стабильными, так как они попадают в персист.
-const (
-	// RecipientTypeUser указывает, что уведомление предназначено конкретному пользователю.
-	RecipientTypeUser = "user"
-	// RecipientTypeChat означает групповую беседу (legacy-chats и супергруппы без channel-like API).
-	RecipientTypeChat = "chat"
-	// RecipientTypeChannel маркирует каналы и мегагруппы, требующие InputPeerChannel.
-	RecipientTypeChannel = "channel"
+	"telegram-userbot/internal/domain/filters"
 )
 
 // ForwardSpec описывает пересылку оригинального сообщения вместе с уведомлением.
 // Enabled оставлен явным, чтобы отличать «пересылка выключена» от «поле отсутствует в JSON».
 // Если транспорт не умеет пересылку, очередь может сформировать CopyText (см. Payload.Copy).
 type ForwardSpec struct {
-	Enabled    bool      `json:"enabled"`
-	FromPeer   Recipient `json:"from_peer"`
-	MessageIDs []int     `json:"message_ids"`
+	Enabled    bool              `json:"enabled"`
+	FromPeer   filters.Recipient `json:"from_peer"`
+	MessageIDs []int             `json:"message_ids"`
 }
 
 // Payload содержит финальный текст уведомления и опциональную спецификацию пересылки/копии.
@@ -46,12 +32,14 @@ type Payload struct {
 // Job — единица работы очереди уведомлений. Один job адресуется одному получателю.
 // Идентификатор ID монотонно растёт и используется, среди прочего, для детерминированного random_id.
 // Порядок доставки получателям — FIFO.
+// Теперь использует filters.Recipient с полной информацией о TZ и Schedule.
 type Job struct {
-	ID        int64     `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	Urgent    bool      `json:"urgent"`
-	Recipient Recipient `json:"recipient"`
-	Payload   Payload   `json:"payload"`
+	ID          int64             `json:"id"`
+	CreatedAt   time.Time         `json:"created_at"`
+	ScheduledAt time.Time         `json:"scheduled_at"` // Время запланированной отправки в UTC с учетом персональных настроек получателя
+	Urgent      bool              `json:"urgent"`
+	Recipient   filters.Recipient `json:"recipient"` // Полная информация о получателе включая TZ и Schedule
+	Payload     Payload           `json:"payload"`
 }
 
 // State — сериализуемый снимок очереди: бэклоги urgent/regular, счётчик NextID и метки времени.

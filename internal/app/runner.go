@@ -208,17 +208,6 @@ func (r *Runner) handleUpdatesManagerStart(ctx context.Context) {
 	}
 
 	logger.Debug("Updates manager started")
-
-	// Отправляем администратору уведомление о старте сервиса, чтобы зафиксировать успешный запуск.
-	// if config.Env().AdminUID > 0 {
-	// 	if err := r.notif.Send(
-	// 		ctx,
-	// 		int64(config.Env().AdminUID),
-	// 		fmt.Sprintf("%s v%s started", versioninfo.Name, versioninfo.Version),
-	// 	); err != nil {
-	// 		logger.Errorf("failed to send message on start: %v", err)
-	// 	}
-	// }
 }
 
 // registerClientNodes описывает граф узлов lifecycle.Manager, их зависимости и процедуры

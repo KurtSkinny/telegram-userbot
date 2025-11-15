@@ -30,6 +30,8 @@ func (rid *RecipientID) UnmarshalJSON(data []byte) error {
 }
 
 // RecipientType определяет тип получателя: пользователь, чат или канал
+//
+//nolint:recvcheck // UnmarshalJSON requires pointer receiver, others use value receiver
 type RecipientType string
 
 const (
@@ -39,13 +41,18 @@ const (
 )
 
 // IsValid проверяет, что RecipientType имеет допустимое значение
-func (rt *RecipientType) IsValid() bool {
-	switch *rt {
+func (rt RecipientType) IsValid() bool {
+	switch rt {
 	case RecipientTypeUser, RecipientTypeChat, RecipientTypeChannel:
 		return true
 	default:
 		return false
 	}
+}
+
+// String возвращает строковое представление RecipientType
+func (rt RecipientType) String() string {
+	return string(rt)
 }
 
 // UnmarshalJSON реализует проверку на допустимые значения RecipientType
@@ -219,7 +226,80 @@ func ParseLocation(value string) (*time.Location, error) {
 const (
 	secondsInMinute = 60
 	secondsInHour   = secondsInMinute * 60
+	hoursInDay      = 24
 )
+
+// CalculateScheduledTime вычисляет время отправки для получателя с учетом его персональных настроек.
+// Для срочных заданий возвращает текущее время. Для обычных - следующий подходящий слот расписания.
+func (r *Recipient) CalculateScheduledTime(
+	urgent bool,
+	now time.Time,
+	defaultTZ *time.Location,
+	defaultSchedule []string,
+) time.Time {
+	if urgent {
+		return now.UTC() // Срочные задания отправляются немедленно
+	}
+
+	// Определяем эффективную таймзону
+	tz := defaultTZ
+	if r.TZ != "" {
+		if loc, err := ParseLocation(string(r.TZ)); err == nil {
+			tz = loc
+		}
+	}
+
+	// Определяем эффективное расписание
+	schedule := defaultSchedule
+	if len(r.Schedule) > 0 {
+		schedule = make([]string, len(r.Schedule))
+		for i, s := range r.Schedule {
+			schedule[i] = s.Label
+		}
+	}
+
+	return nextScheduleAfter(now, tz, schedule).UTC()
+}
+
+// nextScheduleAfter вычисляет следующий слот расписания после указанного времени.
+func nextScheduleAfter(now time.Time, location *time.Location, schedule []string) time.Time {
+	localNow := now.In(location)
+	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
+
+	// Ищем ближайший слот сегодня
+	for _, timeStr := range schedule {
+		if !IsValidScheduleEntry(timeStr) {
+			continue
+		}
+		parts := strings.Split(timeStr, ":")
+		hour, _ := strconv.Atoi(parts[0])
+		minute, _ := strconv.Atoi(parts[1])
+
+		slot := time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
+			hour, minute, 0, 0, location)
+		if slot.After(localNow) {
+			return slot
+		}
+	}
+
+	// Все слоты прошли - берем первый слот следующего дня
+	if len(schedule) > 0 {
+		timeStr := schedule[0]
+		if IsValidScheduleEntry(timeStr) {
+			parts := strings.Split(timeStr, ":")
+			hour, _ := strconv.Atoi(parts[0])
+			minute, _ := strconv.Atoi(parts[1])
+
+			nextDay := today.Add(hoursInDay * time.Hour)
+			next := time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(),
+				hour, minute, 0, 0, location)
+			return next
+		}
+	}
+
+	// Fallback - если расписание пустое, планируем на завтра в это же время
+	return localNow.Add(hoursInDay * time.Hour)
+}
 
 // parseUTCOffsetToLocation парсит строки вида "+03:00", "-0700", "UTC+3", "GMT-04:30" или "Z".
 // Возвращает фиксированную таймзону и ok=true при успешном разборе.

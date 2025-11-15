@@ -109,7 +109,10 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 		UpdateHandler:  lazyHandler,
 		Middlewares: []telegram.Middleware{
 			a.waiter,
-			ratelimit.New(rate.Limit(config.Env().ThrottleRPS), config.Env().ThrottleRPS*2),
+			ratelimit.New(
+				rate.Limit(config.Env().ThrottleRPS),
+				config.Env().ThrottleRPS*2, //nolint:mnd // burst = 2*rate
+			),
 		},
 		// При сообщении от gotd о «мертвом» соединении отмечаем отключение для зависимых узлов.
 		OnDead: func() {

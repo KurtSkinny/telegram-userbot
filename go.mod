@@ -11,12 +11,10 @@ require (
 	go.etcd.io/bbolt v1.4.3
 	go.uber.org/zap v1.27.0
 	golang.org/x/term v0.36.0
+	golang.org/x/time v0.14.0
 )
 
-require (
-	github.com/shopspring/decimal v1.4.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
-)
+require github.com/shopspring/decimal v1.4.0 // indirect
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect

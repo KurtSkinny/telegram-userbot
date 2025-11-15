@@ -68,8 +68,6 @@ type Service struct {
 	testRunning int64                 // флаг, указывающий, выполняется ли команда test в данный момент (0 - нет, 1 - да)
 }
 
-const defaultContextTimeout = 30 * time.Second
-
 // NewService создаёт CLI-сервис. Параметр stopApp используется как «глобальная»
 // остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
 // команда "flush" инициирует внеочередной слив регулярной очереди уведомлений.
@@ -323,14 +321,14 @@ func (s *Service) handleTest(ctx context.Context) {
 		connection.WaitOnline(ctx)
 		status.GoOnline()
 
-		peer, errPeer := s.peers.InputPeerByKind(ctx, notifications.RecipientTypeUser, adminID)
+		peer, errPeer := s.peers.InputPeerByKind(ctx, filters.RecipientTypeUser.String(), adminID)
 		if errPeer != nil {
 			logger.Errorf("CLI test command: resolve admin peer failed: %v", errPeer)
 			return
 		}
 
 		// Формируем получателя в терминах доменной модели уведомлений.
-		recipient := notifications.Recipient{Type: notifications.RecipientTypeUser, ID: adminID}
+		recipient := filters.Recipient{Type: filters.RecipientTypeUser, PeerID: filters.RecipientPeerID(adminID)}
 		job := notifications.Job{
 			ID:        time.Now().UnixNano(),
 			CreatedAt: time.Now(),

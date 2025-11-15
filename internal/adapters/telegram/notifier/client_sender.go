@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 
+	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
@@ -23,8 +24,6 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
-
-
 
 // ClientSender реализует notifications.PreparedSender поверх MTProto-клиента.
 // Поля:
@@ -48,8 +47,6 @@ func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSe
 		peers: peers,
 	}
 }
-
-
 
 // BeforeDrain вызывается очередью один раз перед первой фактической отправкой
 // в рамках сессии дренирования (urgent или regular). Выполняет:
@@ -81,9 +78,9 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	needForward := fwd != nil && fwd.Enabled && len(fwd.MessageIDs) > 0
 
 	recipient := job.Recipient
-	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type, recipient.ID)
+	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type.String(), int64(recipient.PeerID))
 	if errPeer != nil {
-		logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.ID, errPeer)
+		logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.PeerID, errPeer)
 		outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
 		outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)
 		return outcome, nil
@@ -131,7 +128,7 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 // Понимает ошибки контекста.
 func (s *ClientSender) handleAPIErr(
 	err error,
-	recipient notifications.Recipient,
+	recipient filters.Recipient,
 	outcome *notifications.SendOutcome,
 ) (bool, error) {
 	if err == nil {
@@ -169,7 +166,7 @@ func (s *ClientSender) handleAPIErr(
 func (s *ClientSender) apiSendMessage(
 	ctx context.Context,
 	job notifications.Job,
-	recipient notifications.Recipient,
+	recipient filters.Recipient,
 	peer tg.InputPeerClass,
 ) error {
 	// Детерминированный random_id: одинаков для всех ретраев этой пары (recipient).
@@ -187,14 +184,14 @@ func (s *ClientSender) apiSendMessage(
 
 	logger.Debugf(
 		"ClientSender: send message job=%d recipient=%d random_id=%d",
-		job.ID, recipient.ID, randomID,
+		job.ID, recipient.PeerID, randomID,
 	)
 
 	_, err := s.api.MessagesSendMessage(ctx, req)
 	if err != nil {
 		logger.Debugf(
 			"ClientSender: send message failed job=%d recipient=%d random_id=%d err=%v",
-			job.ID, recipient.ID, randomID, err,
+			job.ID, recipient.PeerID, randomID, err,
 		)
 	}
 	return err
@@ -206,13 +203,13 @@ func (s *ClientSender) apiSendMessage(
 func (s *ClientSender) apiForwardMessages(
 	ctx context.Context,
 	job notifications.Job,
-	recipient notifications.Recipient,
+	recipient filters.Recipient,
 	toPeer tg.InputPeerClass,
 ) error {
 	fwd := job.Payload.Forward
-	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
+	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type.String(), int64(fwd.FromPeer.PeerID))
 	if err != nil {
-		return fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err)
+		return fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.PeerID, err)
 	}
 
 	// Для каждого исходного message_id генерируем свой random_id для идемпотентности ретраев.
@@ -223,7 +220,7 @@ func (s *ClientSender) apiForwardMessages(
 
 	logger.Debugf(
 		"ClientSender: forward messages job=%d recipient=%d message_ids=%v random_ids=%v",
-		job.ID, recipient.ID, fwd.MessageIDs, randomIDs,
+		job.ID, recipient.PeerID, fwd.MessageIDs, randomIDs,
 	)
 
 	req := &tg.MessagesForwardMessagesRequest{
@@ -238,12 +235,8 @@ func (s *ClientSender) apiForwardMessages(
 	if errFwd != nil {
 		logger.Debugf(
 			"ClientSender: forward failed job=%d recipient=%d message_ids=%v err=%v",
-			job.ID, recipient.ID, fwd.MessageIDs, errFwd,
+			job.ID, recipient.PeerID, fwd.MessageIDs, errFwd,
 		)
 	}
 	return errFwd
 }
-
-
-
-
