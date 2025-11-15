@@ -425,13 +425,13 @@ func (q *Queue) checkScheduledJobs(now time.Time) {
 			readyCount++
 		}
 	}
-	q.mu.Unlock()
 
 	if hasReadyJobs {
 		logger.Debugf("Queue: found %d scheduled jobs ready at %s",
 			readyCount, now.Format(time.RFC3339))
 		q.signalRegularDrain("scheduled jobs ready")
 	}
+	q.mu.Unlock()
 }
 
 // schedulerLoop запускается каждую минуту и проверяет, есть ли задания готовые к отправке.
@@ -620,18 +620,19 @@ func (q *Queue) requeueJob(job Job, front bool) {
 	clone := job.Clone()
 
 	// Для регулярных заданий пересчитываем время отправки, чтобы избежать немедленного повтора
+	// Сохраняем персональные настройки получателя при requeue
 	if !job.Urgent {
-		// Создаем пустого получателя для fallback на дефолтные настройки
-		emptyRecipient := filters.Recipient{}
-
 		// Конвертируем глобальное schedule в строки
 		defaultSchedule := make([]string, len(q.schedule))
 		for i, entry := range q.schedule {
 			defaultSchedule[i] = fmt.Sprintf("%02d:%02d", entry.hour, entry.minute)
 		}
 
-		clone.ScheduledAt = emptyRecipient.CalculateScheduledTime(job.Urgent, q.now(), q.location, defaultSchedule)
-		logger.Debugf("Queue: job %d rescheduled for %s due to requeue (using default schedule)",
+		// Используем ОРИГИНАЛЬНОГО получателя с его персональными настройками
+		// Добавляем небольшую задержку (5 минут) для retry, чтобы избежать immediate retry loop
+		retryTime := q.now().Add(5 * time.Minute) //nolint:mnd // retry delay 5 minutes
+		clone.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, retryTime, q.location, defaultSchedule)
+		logger.Debugf("Queue: job %d rescheduled for %s due to requeue (keeping personal settings, +5min delay)",
 			clone.ID, clone.ScheduledAt.Format(time.RFC3339))
 	}
 
@@ -724,6 +725,11 @@ func (q *Queue) FlushImmediately(reason string) {
 
 // nextScheduleAfter вычисляет следующий слот расписания в локальной таймзоне и возвращает его в UTC.
 func (q *Queue) nextScheduleAfter(now time.Time) time.Time {
+	if len(q.schedule) == 0 {
+		logger.Errorf("Queue: empty schedule detected, falling back to +1 hour")
+		return now.Add(time.Hour).UTC()
+	}
+
 	localNow := now.In(q.location)
 	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, q.location)
 
@@ -743,6 +749,11 @@ func (q *Queue) nextScheduleAfter(now time.Time) time.Time {
 
 // previousScheduleAt возвращает предыдущий слот расписания относительно now в локальной таймзоне (результат в UTC).
 func (q *Queue) previousScheduleAt(now time.Time) time.Time {
+	if len(q.schedule) == 0 {
+		logger.Errorf("Queue: empty schedule detected in previousScheduleAt, falling back to -1 hour")
+		return now.Add(-time.Hour).UTC()
+	}
+
 	localNow := now.In(q.location)
 	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, q.location)
 
