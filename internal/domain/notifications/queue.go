@@ -337,7 +337,7 @@ func (q *Queue) enqueue(job Job) int64 {
 	q.persistLocked()
 	q.mu.Unlock()
 
-	logger.Debugf("Queue: job %d scheduled for %s (recipient=%s:%d, urgent=%t, tz=%s)",
+	logger.Debugf("Queue: job %d scheduled for %s UTC (recipient=%s:%d, urgent=%t, tz=%s)",
 		jobID, job.ScheduledAt.Format(time.RFC3339), job.Recipient.Type, job.Recipient.PeerID,
 		job.Urgent, job.Recipient.TZ)
 
@@ -427,7 +427,7 @@ func (q *Queue) checkScheduledJobs(now time.Time) {
 	}
 
 	if hasReadyJobs {
-		logger.Debugf("Queue: found %d scheduled jobs ready at %s",
+		logger.Debugf("Queue: found %d scheduled jobs ready at %s UTC",
 			readyCount, now.Format(time.RFC3339))
 		q.signalRegularDrain("scheduled jobs ready")
 	}
@@ -436,16 +436,36 @@ func (q *Queue) checkScheduledJobs(now time.Time) {
 
 // schedulerLoop запускается каждую минуту и проверяет, есть ли задания готовые к отправке.
 // Заменяет старую логику расписания на персональную проверку времени отправки каждого задания.
+// Синхронизируется с началом системных минут для точного срабатывания в :00 секунд.
 func (q *Queue) schedulerLoop() {
+	// Синхронизируемся с началом следующей минуты
+	now := q.now()
+	nextMinute := now.Truncate(time.Minute).Add(time.Minute)
+	sleepDuration := nextMinute.Sub(now)
+
+	logger.Debugf("Queue: scheduler will start at %s UTC (sleeping %v)",
+		nextMinute.Format(time.RFC3339), sleepDuration)
+
+	// Ждем до начала следующей минуты
+	select {
+	case <-q.ctx.Done():
+		return
+	case <-time.After(sleepDuration):
+	}
+
+	// Теперь ticker будет срабатывать точно в :00 секунд каждой минуты
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+
+	// Первая проверка сразу после синхронизации
+	q.checkScheduledJobs(q.now())
 
 	for {
 		select {
 		case <-q.ctx.Done():
 			return
-		case now := <-ticker.C:
-			q.checkScheduledJobs(now)
+		case tickTime := <-ticker.C:
+			q.checkScheduledJobs(tickTime)
 		}
 	}
 }
@@ -632,7 +652,7 @@ func (q *Queue) requeueJob(job Job, front bool) {
 		// Добавляем небольшую задержку (5 минут) для retry, чтобы избежать immediate retry loop
 		retryTime := q.now().Add(5 * time.Minute) //nolint:mnd // retry delay 5 minutes
 		clone.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, retryTime, q.location, defaultSchedule)
-		logger.Debugf("Queue: job %d rescheduled for %s due to requeue (keeping personal settings, +5min delay)",
+		logger.Debugf("Queue: job %d rescheduled for %s UTC due to requeue (keeping personal settings, +5min delay)",
 			clone.ID, clone.ScheduledAt.Format(time.RFC3339))
 	}
 
