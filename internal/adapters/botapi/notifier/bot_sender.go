@@ -24,8 +24,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"telegram-userbot/internal/domain/notifications"
-	"telegram-userbot/internal/infra/throttle"
 )
 
 // httpClientTimeout — таймаут HTTP‑клиента, секунды. Должен покрывать сетевые
@@ -41,11 +42,11 @@ const botSuperPrefix int64 = -1000000000000
 // Поля:
 //   - baseURL — конечная точка sendMessage для заданного бота (с учётом /test);
 //   - client  — HTTP‑клиент с умеренным таймаутом;
-//   - limiter — общий троттлер (token bucket) c поддержкой BotAPIRetryAfterExtractor.
+//   - limiter — общий троттлер (token bucket).
 type BotSender struct {
 	baseURL string
 	client  *http.Client
-	limiter *throttle.Throttler
+	limiter *rate.Limiter
 }
 
 // NewBotSender создаёт PreparedSender для бота.
@@ -53,7 +54,6 @@ type BotSender struct {
 // Поведение:
 //   - при testDC=true добавляет суффикс /test к токену согласно Bot API;
 //   - формирует базовый URL вида https://api.telegram.org/bot<token>/sendMessage;
-//   - подключает троттлер с экстрактором BotAPIRetryAfterExtractor;
 //   - rps задаёт целевую среднюю частоту запросов.
 func NewBotSender(token string, testDC bool, rps int) *BotSender {
 	if testDC {
@@ -61,35 +61,16 @@ func NewBotSender(token string, testDC bool, rps int) *BotSender {
 	}
 	base := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 
-	// Троттлер ограничивает частоту и уважает retry_after из ответов сервера.
-	limiter := throttle.New(
-		rps,
-		throttle.WithWaitExtractors(BotAPIRetryAfterExtractor()),
-	)
-
 	return &BotSender{
 		baseURL: base,
 		client: &http.Client{
 			Timeout: httpClientTimeout * time.Second,
 		},
-		limiter: limiter,
+		limiter: rate.NewLimiter(rate.Limit(rps), rps),
 	}
 }
 
-// Start подключает троттлер к жизненному циклу очереди.
-// Без запуска троттлер не выдаёт токены, Do() вернут ошибку ожидания.
-func (s *BotSender) Start(ctx context.Context) {
-	if s.limiter != nil {
-		s.limiter.Start(ctx)
-	}
-}
 
-// Stop завершает фоновые горутины троттлера и освобождает ресурсы.
-func (s *BotSender) Stop() {
-	if s.limiter != nil {
-		s.limiter.Stop()
-	}
-}
 
 // toBotChatID конвертирует доменного получателя в корректный chat_id для Bot API.
 // Пользователь → положительный id. Basic group → отрицательный id.
@@ -176,33 +157,10 @@ func (s *BotSender) Deliver(ctx context.Context, job notifications.Job) (notific
 //
 // При наличии троттлера запрос выполняется внутри limiter.Do().
 func (s *BotSender) sendMessage(ctx context.Context, chatID int64, text string) (bool, error) {
-	if s.limiter == nil {
-		return s.performSend(ctx, chatID, text)
-	}
-
-	var permanent bool
-	var requestErr error
-
-	err := s.limiter.Do(ctx, func() error {
-		var sendErr error
-		permanent, sendErr = s.performSend(ctx, chatID, text)
-		requestErr = sendErr
-		if sendErr == nil {
-			return nil
-		}
-		if permanent {
-			return &stopRetryError{err: sendErr}
-		}
-		return sendErr
-	})
-	if err != nil {
-		if permanent {
-			return true, requestErr
-		}
+	if err := s.limiter.Wait(ctx); err != nil {
 		return false, err
 	}
-
-	return false, nil
+	return s.performSend(ctx, chatID, text)
 }
 
 // performSend выполняет запрос без троттлера. Обрабатывает HTTP/JSON ответы и
@@ -242,21 +200,10 @@ func (s *BotSender) sendMessageRich(
 	ctx context.Context, chatID int64, text string,
 	entities []notifications.CopyEntity,
 ) (bool, error) {
-	if s.limiter == nil {
-		return s.performSendRich(ctx, chatID, text, entities)
+	if err := s.limiter.Wait(ctx); err != nil {
+		return false, err
 	}
-	var permanent bool
-	var sendErr error
-	// Выполняем под троттлером
-	err := s.limiter.Do(ctx, func() error {
-		var errDo error
-		permanent, errDo = s.performSendRich(ctx, chatID, text, entities)
-		return errDo
-	})
-	if err != nil {
-		return permanent, err
-	}
-	return permanent, sendErr
+	return s.performSendRich(ctx, chatID, text, entities)
 }
 
 // performSendRich делает POST JSON на /sendMessage с полем entities.
@@ -318,15 +265,7 @@ func handleHTTPError(resp *http.Response, body []byte) (bool, error) {
 
 	switch {
 	case status == http.StatusTooManyRequests:
-		wait := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
-		if wait <= 0 {
-			wait = parseRetryAfterBody(body)
-		}
-		baseErr := fmt.Errorf("bot api rate limit (%d): %s", status, msg)
-		if wait > 0 {
-			return false, &retryAfterError{err: baseErr, wait: wait}
-		}
-		return false, baseErr
+		return false, fmt.Errorf("bot api rate limit (%d): %s", status, msg)
 	case status >= 400 && status < 500:
 		return true, fmt.Errorf("bot api client error (%d): %s", status, msg)
 	default:
@@ -358,13 +297,8 @@ func handleJSONResponse(body []byte) (bool, error) {
 		msg = "(empty bot api description)"
 	}
 
-	wait := time.Duration(apiResp.Parameters.RetryAfter) * time.Second
-	if apiResp.ErrorCode == http.StatusTooManyRequests || wait > 0 {
-		if wait <= 0 {
-			wait = time.Second
-		}
-		baseErr := fmt.Errorf("bot api rate limit (%d): %s", apiResp.ErrorCode, msg)
-		return false, &retryAfterError{err: baseErr, wait: wait}
+	if apiResp.ErrorCode == http.StatusTooManyRequests {
+		return false, fmt.Errorf("bot api rate limit (%d): %s", apiResp.ErrorCode, msg)
 	}
 
 	if isPermanentBotError(apiResp.ErrorCode, apiResp.Description) {
@@ -425,39 +359,4 @@ func isPermanentBotError(code int, desc string) bool {
 	return code >= 400 && code < 500
 }
 
-// retryAfterError — ошибка-носитель retry_after для экстрактора ожиданий.
-// Реализует интерфейс retryAfterProvider.
-type retryAfterError struct {
-	err  error
-	wait time.Duration
-}
 
-func (e *retryAfterError) Error() string {
-	return e.err.Error()
-}
-
-func (e *retryAfterError) Unwrap() error {
-	return e.err
-}
-
-func (e *retryAfterError) RetryAfter() time.Duration {
-	return e.wait
-}
-
-// stopRetryError — маркер для прекращения ретраев на уровне очереди.
-// Используется, когда ошибка постоянна для конкретного адресата.
-type stopRetryError struct {
-	err error
-}
-
-func (e *stopRetryError) Error() string {
-	return e.err.Error()
-}
-
-func (e *stopRetryError) Unwrap() error {
-	return e.err
-}
-
-func (e *stopRetryError) StopRetry() bool {
-	return true
-}

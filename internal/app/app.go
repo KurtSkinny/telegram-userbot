@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	botapionotifier "telegram-userbot/internal/adapters/botapi/notifier"
@@ -24,15 +25,39 @@ import (
 
 	"github.com/go-faster/errors"
 	"go.etcd.io/bbolt"
+	"golang.org/x/time/rate"
 
 	boltstor "github.com/gotd/contrib/bbolt"
+	"github.com/gotd/contrib/middleware/floodwait"
+	"github.com/gotd/contrib/middleware/ratelimit"
 	contribstorage "github.com/gotd/contrib/storage"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
 	tgupdates "github.com/gotd/td/telegram/updates"
-	updhook "github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
 )
+
+// lazyUpdateHandler — это обёртка, которая позволяет отложить установку
+// реального обработчика апдейтов, разрывая цикл инициализации.
+type lazyUpdateHandler struct {
+	mu      sync.RWMutex
+	handler telegram.UpdateHandler
+}
+
+func (h *lazyUpdateHandler) Handle(ctx context.Context, u tg.UpdatesClass) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.handler != nil {
+		return h.handler.Handle(ctx, u)
+	}
+	return nil
+}
+
+func (h *lazyUpdateHandler) set(realHandler telegram.UpdateHandler) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.handler = realHandler
+}
 
 // App агрегирует зависимости userbot и управляет их связью.
 // Отвечает за:
@@ -50,6 +75,7 @@ type App struct {
 	runner    *Runner                   // Оркестратор жизненного цикла и CLI.
 	updMgr    *tgupdates.Manager        // Менеджер апдейтов gotd: поток событий и локальное состояние.
 	peers     *peersmgr.Service         // Менеджер пиров + persist storage.
+	waiter    *floodwait.Waiter         // Middleware для обработки FLOOD_WAIT.
 	ctx       context.Context           // Внешний контекст приложения (отменяется по сигналам/CLI).
 	stop      context.CancelFunc        // Инициирует общий shutdown.
 }
@@ -74,26 +100,16 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.ctx = ctx
 	a.stop = stop
 	dispatcher := tg.NewUpdateDispatcher()
-	var updateFunc func(context.Context, tg.UpdatesClass) error
-	updateHandlerProxy := telegram.UpdateHandlerFunc(func(handlerCtx context.Context, updates tg.UpdatesClass) error {
-		if updateFunc != nil {
-			return updateFunc(handlerCtx, updates)
-		}
-		if a.updMgr != nil {
-			return a.updMgr.Handle(handlerCtx, updates)
-		}
-		return nil
-	})
+	lazyHandler := &lazyUpdateHandler{}
+	a.waiter = floodwait.NewWaiter()
 
 	// 1) Опции MTProto‑клиента: сессии, хуки апдейтов, поведение при dead‑соединении и паспорт устройства.
 	options := telegram.Options{
 		SessionStorage: &session.FileStorage{Path: config.Env().SessionFile},
-		UpdateHandler:  updateHandlerProxy,
+		UpdateHandler:  lazyHandler,
 		Middlewares: []telegram.Middleware{
-			updhook.UpdateHook(func(mwCtx context.Context, updates tg.UpdatesClass) error {
-				return updateHandlerProxy.Handle(mwCtx, updates)
-			}),
-			// connstate.Middleware(updhook.UpdateHook(a.updMgr.Handle)),
+			a.waiter,
+			ratelimit.New(rate.Limit(config.Env().ThrottleRPS), config.Env().ThrottleRPS*2),
 		},
 		// При сообщении от gotd о «мертвом» соединении отмечаем отключение для зависимых узлов.
 		OnDead: func() {
@@ -142,7 +158,10 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 		// Logger:  logger.Logger().Named("Update_Manager"),
 	}
 	a.updMgr = tgupdates.New(updConfig)
-	updateFunc = contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store()).Handle
+
+	// Устанавливаем реальный обработчик в lazyHandler
+	realHandler := contribstorage.UpdateHook(peersSvc.Mgr.UpdateHook(a.updMgr), peersSvc.Store())
+	lazyHandler.set(realHandler)
 
 	// Инициализация filters
 	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
@@ -216,5 +235,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 // Run делегирует запуск основного цикла Runner’у с уже сконфигурированным менеджером апдейтов.
 func (a *App) Run() error {
-	return a.runner.Run(a.updMgr)
+	return a.waiter.Run(a.ctx, func(ctx context.Context) error {
+		return a.runner.Run(a.updMgr)
+	})
 }

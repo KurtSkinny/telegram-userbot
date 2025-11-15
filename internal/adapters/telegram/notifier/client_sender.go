@@ -19,50 +19,20 @@ import (
 	"telegram-userbot/internal/infra/telegram/peersmgr"
 	telegramruntime "telegram-userbot/internal/infra/telegram/runtime"
 	"telegram-userbot/internal/infra/telegram/status"
-	"telegram-userbot/internal/infra/throttle"
 
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
 
-// stopRetryReason используется для высокоуровневой классификации причин
-// остановки ретраев. Значение вкладывается в stopRetryError и считывается
-// внешней логикой Deliver/троттлером.
-type stopRetryReason int
 
-const (
-	// stopRetryReasonPermanent — повторять бессмысленно (например, 400-ошибка).
-	stopRetryReasonPermanent stopRetryReason = iota
-	// stopRetryReasonNetwork — требуется дождаться восстановления соединения.
-	stopRetryReasonNetwork
-)
-
-// stopRetryError — обёртка над первичной ошибкой, сигнализирующая, что
-// ретраи нужно прекратить. Метод StopRetry() позволяет троттлеру распознать
-// её без привязки к конкретным типам ошибок Telegram.
-type stopRetryError struct {
-	err    error
-	reason stopRetryReason
-}
-
-func (e *stopRetryError) Error() string { return e.err.Error() }
-
-func (e *stopRetryError) Unwrap() error { return e.err }
-
-// StopRetry позволяет throttler'у распознать необходимость выхода из цикла.
-func (e *stopRetryError) StopRetry() bool { return true }
-
-// Reason возвращает причину остановки повторов.
-func (e *stopRetryError) Reason() stopRetryReason { return e.reason }
 
 // ClientSender реализует notifications.PreparedSender поверх MTProto-клиента.
 // Поля:
 //   - api — клиент Telegram;
 //   - limiter — троттлер запросов (token bucket) с поддержкой FLOOD_WAIT.
 type ClientSender struct {
-	api     *tg.Client
-	limiter *throttle.Throttler
-	peers   *peersmgr.Service
+	api   *tg.Client
+	peers *peersmgr.Service
 }
 
 // NewClientSender создаёт PreparedSender, оборачивая tg.Client троттлером.
@@ -72,33 +42,14 @@ func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSe
 	if peers == nil {
 		panic("ClientSender: peers manager must not be nil")
 	}
-	// Троттлер ограничивает RPS и умеет извлекать обязательные паузы из FLOOD_WAIT.
-	throttler := throttle.New(
-		rps,
-		throttle.WithWaitExtractors(FloodWaitExtractor()),
-	)
 
 	return &ClientSender{
-		api:     api,
-		limiter: throttler,
-		peers:   peers,
+		api:   api,
+		peers: peers,
 	}
 }
 
-// Start привязывает ограничитель скорости к контексту жизненного цикла очереди.
-// Без запуска троттлер не будет выдавать токены и все Do() вернутся с ошибкой ожидания.
-func (s *ClientSender) Start(ctx context.Context) {
-	if s.limiter != nil {
-		s.limiter.Start(ctx)
-	}
-}
 
-// Stop завершает фоновые горутины токен-бакета и освобождает ресурсы троттлера.
-func (s *ClientSender) Stop() {
-	if s.limiter != nil {
-		s.limiter.Stop()
-	}
-}
 
 // BeforeDrain вызывается очередью один раз перед первой фактической отправкой
 // в рамках сессии дренирования (urgent или regular). Выполняет:
@@ -177,7 +128,7 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 //   - skip=любой, err!=nil — немедленное завершение Deliver с этой ошибкой;
 //   - skip=false, err=nil  — продолжаем текущего адресата.
 //
-// Понимает stopRetryError и ошибки контекста.
+// Понимает ошибки контекста.
 func (s *ClientSender) handleAPIErr(
 	err error,
 	recipient notifications.Recipient,
@@ -187,19 +138,23 @@ func (s *ClientSender) handleAPIErr(
 		return false, nil
 	}
 
-	if stop, underlying, ok := extractStopReason(err); ok {
-		switch stop {
-		case stopRetryReasonNetwork:
-			outcome.NetworkDown = true
-			return false, underlying
-		case stopRetryReasonPermanent:
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false, err
+	}
+
+	rpcErr, ok := tgerr.As(err)
+	if ok {
+		// PEER_FLOOD считается постоянной ошибкой для массовых рассылок.
+		if rpcErr.Type == "PEER_FLOOD" || (rpcErr.Code >= 400 && rpcErr.Code < 500) {
 			outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
-			outcome.PermanentError = errors.Join(outcome.PermanentError, underlying)
+			outcome.PermanentError = errors.Join(outcome.PermanentError, err)
 			return true, nil
 		}
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// Сетевые/MTProto-сбои: просим внешний цикл подождать восстановления соединения.
+	if connection.HandleError(err) {
+		outcome.NetworkDown = true
 		return false, err
 	}
 
@@ -235,27 +190,14 @@ func (s *ClientSender) apiSendMessage(
 		job.ID, recipient.ID, randomID,
 	)
 
-	return s.limiter.Do(ctx, func() error {
-		_, err := s.api.MessagesSendMessage(ctx, req)
-		if err == nil {
-			return nil
-		}
-
+	_, err := s.api.MessagesSendMessage(ctx, req)
+	if err != nil {
 		logger.Debugf(
 			"ClientSender: send message failed job=%d recipient=%d random_id=%d err=%v",
 			job.ID, recipient.ID, randomID, err,
 		)
-
-		// Сетевые/MTProto-сбои: просим внешний цикл подождать восстановления соединения.
-		if connection.HandleError(err) {
-			return &stopRetryError{err: err, reason: stopRetryReasonNetwork}
-		}
-		// Постоянные ошибки (4xx/PEER_FLOOD и т.п.): ретраить бессмысленно, пометим адресата.
-		if isPermanentRPCError(err) {
-			return &stopRetryError{err: err, reason: stopRetryReasonPermanent}
-		}
-		return err
-	})
+	}
+	return err
 }
 
 // apiForwardMessages повторно пересылает оригинальные сообщения после успешной доставки текста.
@@ -270,10 +212,7 @@ func (s *ClientSender) apiForwardMessages(
 	fwd := job.Payload.Forward
 	fromPeer, err := s.peers.InputPeerByKind(ctx, fwd.FromPeer.Type, fwd.FromPeer.ID)
 	if err != nil {
-		return &stopRetryError{
-			err:    fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err),
-			reason: stopRetryReasonPermanent,
-		}
+		return fmt.Errorf("resolve forward peer %s:%d: %w", fwd.FromPeer.Type, fwd.FromPeer.ID, err)
 	}
 
 	// Для каждого исходного message_id генерируем свой random_id для идемпотентности ретраев.
@@ -295,56 +234,16 @@ func (s *ClientSender) apiForwardMessages(
 		RandomID: randomIDs,
 	}
 
-	return s.limiter.Do(ctx, func() error {
-		_, errFwd := s.api.MessagesForwardMessages(ctx, req)
-		if errFwd == nil {
-			return nil
-		}
-
+	_, errFwd := s.api.MessagesForwardMessages(ctx, req)
+	if errFwd != nil {
 		logger.Debugf(
 			"ClientSender: forward failed job=%d recipient=%d message_ids=%v err=%v",
 			job.ID, recipient.ID, fwd.MessageIDs, errFwd,
 		)
-
-		// Сетевые/MTProto-сбои при форварде: просим подождать восстановление.
-		if connection.HandleError(errFwd) {
-			return &stopRetryError{err: errFwd, reason: stopRetryReasonNetwork}
-		}
-		// Постоянная RPC-ошибка — пропускаем адресата, повторять нет смысла.
-		if isPermanentRPCError(errFwd) {
-			return &stopRetryError{err: errFwd, reason: stopRetryReasonPermanent}
-		}
-		return errFwd
-	})
+	}
+	return errFwd
 }
 
-// extractStopReason извлекает stopRetryError и возвращает (reason, underlying, true).
-// Если err не является stopRetryError, возвращает (0, err, false).
-func extractStopReason(err error) (stopRetryReason, error, bool) {
-	var stopErr *stopRetryError
-	if errors.As(err, &stopErr) {
-		return stopErr.reason, stopErr.err, true
-	}
-	return 0, err, false
-}
 
-// isPermanentRPCError классифицирует RPC-ошибки Telegram: FLOOD_WAIT — временная;
-// PEER_FLOOD и прочие 4xx считаются постоянными для нашей модели доставки.
-func isPermanentRPCError(err error) bool {
-	rpcErr, ok := tgerr.As(err)
-	if !ok {
-		return false
-	}
-	// FLOOD_WAIT относится к временным ошибкам.
-	if rpcErr.Type == "FLOOD_WAIT" {
-		return false
-	}
-	// PEER_FLOOD считается постоянной ошибкой для массовых рассылок.
-	if rpcErr.Type == "PEER_FLOOD" {
-		return true
-	}
-	if rpcErr.Code >= 400 && rpcErr.Code < 500 {
-		return true
-	}
-	return false
-}
+
+

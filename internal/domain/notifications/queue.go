@@ -209,9 +209,6 @@ func (q *Queue) Start(ctx context.Context) {
 		// runOnce гарантирует, что очередь запустится только один раз даже при повторных вызовах.
 		q.ctx, q.cancel = context.WithCancel(ctx)
 		q.store.Start()
-		if lifecycle, ok := q.sender.(interface{ Start(context.Context) }); ok {
-			lifecycle.Start(q.ctx)
-		}
 		q.wg.Go(q.workerLoop)
 		q.wg.Go(q.schedulerLoop)
 
@@ -258,10 +255,6 @@ func (q *Queue) Close(ctx context.Context) error {
 	case <-done:
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-
-	if lifecycle, ok := q.sender.(interface{ Stop() }); ok {
-		lifecycle.Stop()
 	}
 
 	if err := q.store.Flush(ctx); err != nil {

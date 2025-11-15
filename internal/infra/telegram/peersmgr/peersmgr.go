@@ -131,65 +131,39 @@ func (s *Service) Dialogs() []DialogRef {
 
 // LoadFromStorage прогружает сохранённые peers из bbolt в оперативный peers.Manager.
 func (s *Service) LoadFromStorage(ctx context.Context) error {
-	iter, exists, err := s.iterateStoredPeers(ctx)
-	if err != nil {
-		if isJSONUnmarshalError(err) {
-			_ = s.resetPeersBucket()
-			return nil
-		}
-		return fmt.Errorf("peersmgr: iterate stored peers: %w", err)
+	// Проверяем существование бакета перед итерацией
+	exists := false
+	if err := s.db.View(func(tx *bbolt.Tx) error {
+		exists = tx.Bucket(peersBucketBytes) != nil
+		return nil
+	}); err != nil {
+		return fmt.Errorf("peersmgr: check bucket existence: %w", err)
 	}
 	if !exists {
 		return nil
+	}
+
+	iter, err := s.store.Iterate(ctx)
+	if err != nil {
+		return fmt.Errorf("peersmgr: iterate stored peers: %w", err)
 	}
 	defer func() { _ = iter.Close() }()
 
 	users, chats := make([]tg.UserClass, 0), make([]tg.ChatClass, 0)
 
-	addUser := func(value contribstorage.Peer) {
-		user := value.User
-		if user == nil {
-			user = &tg.User{
-				ID:         value.Key.ID,
-				AccessHash: value.Key.AccessHash,
-			}
-		}
-		users = append(users, user)
-	}
-	addChat := func(value contribstorage.Peer) {
-		chat := value.Chat
-		if chat == nil {
-			chat = &tg.Chat{ID: value.Key.ID}
-		}
-		chats = append(chats, chat)
-	}
-	addChannel := func(value contribstorage.Peer) {
-		channel := value.Channel
-		if channel == nil {
-			channel = &tg.Channel{
-				ID:         value.Key.ID,
-				AccessHash: value.Key.AccessHash,
-			}
-		}
-		chats = append(chats, channel)
-	}
-
 	for iter.Next(ctx) {
-		switch value := iter.Value(); value.Key.Kind {
+		value := iter.Value()
+		switch value.Key.Kind {
 		case dialogs.User:
-			addUser(value)
+			users = append(users, value.User)
 		case dialogs.Chat:
-			addChat(value)
+			chats = append(chats, value.Chat)
 		case dialogs.Channel:
-			addChannel(value)
+			chats = append(chats, value.Channel)
 		}
 	}
 
 	if err = iter.Err(); err != nil {
-		if isJSONUnmarshalError(err) {
-			_ = s.resetPeersBucket()
-			return nil
-		}
 		return fmt.Errorf("peersmgr: iterate stored peers: %w", err)
 	}
 	if len(users) == 0 && len(chats) == 0 {
@@ -319,7 +293,7 @@ func (s *Service) ResolvePeer(ctx context.Context, kind DialogKind, id int64) (p
 
 // RefreshDialogs пере Fetch диалогов, обновляет peers.Manager, персистентное хранилище и снимок.
 func (s *Service) RefreshDialogs(ctx context.Context, api *tg.Client) error {
-	client := s.selectAPI(api)
+	client := s.Mgr.API()
 	if client == nil {
 		return errors.New("peersmgr: telegram client is nil")
 	}
@@ -334,17 +308,6 @@ func (s *Service) RefreshDialogs(ctx context.Context, api *tg.Client) error {
 	}
 	if err = s.saveDialogsSnapshot(dialogs.Dialogs); err != nil {
 		return fmt.Errorf("peersmgr: persist dialogs snapshot: %w", err)
-	}
-	return nil
-}
-
-// selectAPI выбирает приоритетный tg.Client: переданный явно или из менеджера.
-func (s *Service) selectAPI(explicit *tg.Client) *tg.Client {
-	if explicit != nil {
-		return explicit
-	}
-	if s.Mgr != nil {
-		return s.Mgr.API()
 	}
 	return nil
 }
@@ -365,28 +328,6 @@ func (s *Service) iterateStoredPeers(ctx context.Context) (contribstorage.PeerIt
 		return nil, false, err
 	}
 	return iter, true, nil
-}
-
-func isJSONUnmarshalError(err error) bool {
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &typeErr) {
-		return true
-	}
-	var syntaxErr *json.SyntaxError
-	if errors.As(err, &syntaxErr) {
-		return true
-	}
-	return strings.Contains(err.Error(), "json:")
-}
-
-func (s *Service) resetPeersBucket() error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		if err := tx.DeleteBucket(peersBucketBytes); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
-			return err
-		}
-		_, err := tx.CreateBucketIfNotExists(peersBucketBytes)
-		return err
-	})
 }
 
 func (s *Service) loadDialogsSnapshot() error {
