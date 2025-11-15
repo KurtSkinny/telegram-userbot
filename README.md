@@ -13,6 +13,7 @@ MTProto‑юзербот на Go 1.25, построенный на базе [got
 - **Фильтры**: новая система фильтрации с поддержкой логических операций (`AND`, `OR`, `NOT`, `AT_LEAST`), ключевых слов и регулярных выражений, с DENY/ALLOW логикой; источники по списку чатов/пользователей/каналов.
 - **Очередь уведомлений**:
   - два контура доставки: `urgent` (уведомления отправляются немедленно) и `regular` (добавляются в очередь и уходят по расписанию), FIFO;
+  - **персонализированное планирование**: индивидуальные таймзоны и расписания для каждого получателя;
   - персист на диск с атомарной записью, журнал неудачных уведомлений;
   - идемпотентность через детерминированные `random_id`.
 - **Доставка**: через MTProto‑клиента или через **Bot API**; у Bot API учитывается `retry_after`, у MTProto — `FLOOD_WAIT` с джиттером.
@@ -66,8 +67,8 @@ cp assets/.env.example assets/.env
 | `NOTIFY_FAILED_FILE` | файл провалов | `data/notify_failed.json` |
 | `NOTIFIED_CACHE_FILE` | кэш «что уже уведомляли» | `data/notified_cache.json` |
 | `NOTIFIED_CACHE_TTL_DAYS` | TTL кэша уведомлений | `30` |
-| `NOTIFY_TIMEZONE` | часовой пояс расписания | `Europe/Moscow` |
-| `NOTIFY_SCHEDULE` | расписание уведомлений, формат `HH:MM[,HH:MM...]` | `08:00,17:00` |
+| `NOTIFY_TIMEZONE` | дефолтный часовой пояс для получателей без персональной `tz` | `Europe/Moscow` |
+| `NOTIFY_SCHEDULE` | дефолтное расписание для получателей без персонального `schedule`, формат `HH:MM[,HH:MM...]` | `08:00,17:00` |
 | `RECIPIENTS_FILE` | файл с определениями получателей | `assets/recipients.json` |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `debug` |
 | `TEST_DC` | `true` для тестового DC (MTProto и Bot API) | `false` |
@@ -95,25 +96,57 @@ cp assets/recipients.json.example assets/recipients.json
   - `tz` - опциональная временная зона (IANA имя или UTC смещение в формате "+03:00")
   - `schedule` - опциональное расписание доставки в формате массива "HH:MM"
 
-**Пример:**
+**Пример с персонализированным планированием:**
 ```json
 {
   "recipients": {
-    "admin_main": {
+    "admin_moscow": {
       "kind": "user",
       "peer_id": 5002402758,
-      "note": "Main administrator",
+      "note": "Main administrator in Moscow",
       "tz": "Europe/Moscow",
       "schedule": ["09:00", "18:00"]
+    },
+    "alice_nyc": {
+      "kind": "user", 
+      "peer_id": 5011122233,
+      "note": "Alice from New York",
+      "tz": "America/New_York",
+      "schedule": ["08:30", "17:30", "20:00"]
+    },
+    "bob_offset": {
+      "kind": "user",
+      "peer_id": 5033445566,
+      "note": "Bob with UTC offset",
+      "tz": "+07:00",
+      "schedule": ["22:00", "06:00"]
     },
     "chat_team": {
       "kind": "chat",
       "peer_id": 45678902232,
-      "note": "Team chat"
+      "note": "Team chat (uses default settings)"
     }
   }
 }
 ```
+
+#### Персонализированные настройки:
+
+- **`tz`** — персональная таймзона в формате IANA (`Europe/Moscow`) или UTC offset (`+03:00`, `-05:30`)
+- **`schedule`** — персональное расписание в формате `["HH:MM", ...]` (время в персональной TZ)
+- **Fallback** — если `tz` или `schedule` не указаны, используются дефолтные значения из `.env`
+- **Срочные уведомления** — игнорируют расписание и отправляются немедленно
+- **Время в логах** — все временные метки отображаются в UTC для консистентности
+
+#### Примеры работы персонализированного планирования:
+
+**Сценарий:** Уведомление создается в 14:00 UTC для трех получателей:
+
+- **Admin Moscow** (`tz: Europe/Moscow`, `schedule: ["09:00", "18:00"]`) → отправится в 18:00 MSK = 15:00 UTC
+- **Alice NYC** (`tz: America/New_York`, `schedule: ["08:30", "17:30"]`) → отправится в 17:30 EST = 22:30 UTC  
+- **Bob default** (без настроек) → использует `NOTIFY_SCHEDULE=08:00,17:00` в `NOTIFY_TIMEZONE=Europe/Moscow` → отправится в 17:00 MSK = 14:00 UTC (немедленно)
+
+**Срочные уведомления** (`urgent: true`) отправляются всем получателям немедленно, игнорируя расписание.
 
 ### 5) Описать правила (`filters.json`)
 
