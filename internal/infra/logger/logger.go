@@ -133,6 +133,13 @@ func Warn(msg string, fields ...zap.Field) { Logger().Warn(msg, fields...) }
 // Error пишет структурированное сообщение об ошибке уровня Error.
 func Error(msg string, fields ...zap.Field) { Logger().Error(msg, fields...) }
 
+// Fatal пишет структурированное сообщение об ошибке уровня Fatal и завершает работу приложения.
+func Fatal(msg string, fields ...zap.Field) {
+	Logger().Fatal(msg, fields...)
+	_ = Logger().Sync() // Обязательно сбросить буферы перед os.Exit
+	os.Exit(1)
+}
+
 // Debugf форматирует сообщение через fmt.Sprintf. Используйте экономно:
 // форматирование аллоцирует; для горячих путей предпочтительны структурированные поля.
 func Debugf(msg string, a ...any) { Logger().Debug(fmt.Sprintf(msg, a...)) }
