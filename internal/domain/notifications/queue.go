@@ -650,7 +650,8 @@ func (q *Queue) requeueJob(job Job, front bool) {
 
 		// Используем ОРИГИНАЛЬНОГО получателя с его персональными настройками
 		// Добавляем небольшую задержку (5 минут) для retry, чтобы избежать immediate retry loop
-		retryTime := q.now().Add(5 * time.Minute) //nolint:mnd // retry delay 5 minutes
+		const retryDelay = 5 * time.Minute
+		retryTime := q.now().Add(retryDelay)
 		clone.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, retryTime, q.location, defaultSchedule)
 		logger.Debugf("Queue: job %d rescheduled for %s UTC due to requeue (keeping personal settings, +5min delay)",
 			clone.ID, clone.ScheduledAt.Format(time.RFC3339))

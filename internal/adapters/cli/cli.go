@@ -218,7 +218,7 @@ func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 		s.handleRefreshDialogs(ctx)
 	case "reload":
 		// Перезагружаем фильтры и получателей с rollback при ошибке
-		if err := s.filters.Init(); err != nil {
+		if err := s.filters.Load(); err != nil {
 			pr.ErrPrintln("reload filters error:", err)
 		}
 		pr.Println("recipients.json and filters.json reloaded")

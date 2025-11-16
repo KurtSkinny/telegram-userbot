@@ -168,11 +168,9 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 
 	// Инициализация filters
 	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
-	if filtersErr := a.filters.Init(); filtersErr != nil {
+	if filtersErr := a.filters.Load(); filtersErr != nil {
 		return fmt.Errorf("load filters: %w", filtersErr)
 	}
-	logger.Infof("Filters loaded: %d total, %d unique chats",
-		len(a.filters.GetFilters()), len(a.filters.GetUniqueChats()))
 
 	// Подсистема уведомлений
 	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
