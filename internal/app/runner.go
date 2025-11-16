@@ -327,7 +327,7 @@ func (r *Runner) registerClientNodes(
 		func(context.Context) error {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), queueShutdownTimeout)
 			defer cancel()
-			return r.notif.Close(shutdownCtx)
+			return r.notif.Stop(shutdownCtx)
 		},
 	); err != nil {
 		return err

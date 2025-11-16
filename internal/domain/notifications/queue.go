@@ -174,11 +174,7 @@ func (q *Queue) Start(ctx context.Context) {
 	})
 }
 
-func (q *Queue) Run(ctx context.Context) {
-	q.Start(ctx)
-}
-
-func (q *Queue) Close(ctx context.Context) error {
+func (q *Queue) Stop(ctx context.Context) error {
 	if q.cancel != nil {
 		q.cancel()
 	}
@@ -283,17 +279,6 @@ func (q *Queue) warnIfLarge(urgentLen, regularLen int) {
 	if regularLen >= warnIfLargeSize {
 		logger.Warnf("Queue: regular backlog reached %d tasks", regularLen)
 	}
-}
-
-func (q *Queue) Size() (int, int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.state.Urgent), len(q.state.Regular)
-}
-
-func (q *Queue) HasPending() bool {
-	u, r := q.Size()
-	return u > 0 || r > 0
 }
 
 func (q *Queue) Stats() QueueStats {
