@@ -25,18 +25,13 @@ import (
 	"github.com/gotd/td/tgerr"
 )
 
-// ClientSender реализует notifications.PreparedSender поверх MTProto-клиента.
-// Поля:
-//   - api — клиент Telegram;
-//   - limiter — троттлер запросов (token bucket) с поддержкой FLOOD_WAIT.
+// ClientSender выполняет доставку уведомлений через заданный MTProto-клиент.
 type ClientSender struct {
 	api   *tg.Client
 	peers *peersmgr.Service
 }
 
-// NewClientSender создаёт PreparedSender, оборачивая tg.Client троттлером.
-// Параметр rps задаёт целевую среднюю частоту запросов. Подключён
-// FloodWaitExtractor для корректной паузы при FLOOD_WAIT/FLOOD_PREMIUM_WAIT.
+// NewClientSender создаёт ClientSender с заданным api и rps (requests per second).
 func NewClientSender(api *tg.Client, rps int, peers *peersmgr.Service) *ClientSender {
 	if peers == nil {
 		panic("ClientSender: peers manager must not be nil")

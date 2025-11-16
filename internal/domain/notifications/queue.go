@@ -613,10 +613,11 @@ func (q *Queue) handleJob(job Job) bool {
 	return false
 }
 
-// requeueJob возвращает задание обратно в соответствующую очередь. front=true — поставить в начало.
-// Для регулярных заданий пересчитывает ScheduledAt, чтобы избежать повторной немедленной отправки.
+// requeueJob возвращает задание обратно в соответствующую очередь, сохраняя его исходное время.
+// front=true — поставить в начало.
 func (q *Queue) requeueJob(job Job, front bool) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 
 	state := &q.state.Regular
 	if job.Urgent {
@@ -625,24 +626,6 @@ func (q *Queue) requeueJob(job Job, front bool) {
 
 	clone := job.Clone()
 
-	// Для регулярных заданий пересчитываем время отправки, чтобы избежать немедленного повтора
-	// Сохраняем персональные настройки получателя при requeue
-	if !job.Urgent {
-		// Конвертируем глобальное schedule в строки
-		defaultSchedule := make([]string, len(q.schedule))
-		for i, entry := range q.schedule {
-			defaultSchedule[i] = fmt.Sprintf("%02d:%02d", entry.hour, entry.minute)
-		}
-
-		// Используем ОРИГИНАЛЬНОГО получателя с его персональными настройками
-		// Добавляем небольшую задержку (5 минут) для retry, чтобы избежать immediate retry loop
-		const retryDelay = 5 * time.Minute
-		retryTime := q.now().Add(retryDelay)
-		clone.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, retryTime, q.location, defaultSchedule)
-		logger.Debugf("Queue: job %d rescheduled for %s UTC due to requeue (keeping personal settings, +5min delay)",
-			clone.ID, clone.ScheduledAt.Format(time.RFC3339))
-	}
-
 	if front {
 		*state = append([]Job{clone}, *state...)
 	} else {
@@ -650,12 +633,11 @@ func (q *Queue) requeueJob(job Job, front bool) {
 	}
 
 	q.persistLocked()
-	q.mu.Unlock()
 
+	// Сигнализируем только для срочных задач, чтобы немедленно их обработать.
+	// Для обычных задач ждем следующего тика планировщика.
 	if job.Urgent {
 		q.signalUrgent()
-	} else if front {
-		q.signalRegularDrain("connection recovery")
 	}
 }
 
