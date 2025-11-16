@@ -3,7 +3,6 @@
 // персистентное хранение состояния/ошибок. Очередь рассчитана на долгую работу,
 // переживает рестарты (persist/restore), соблюдает приоритет срочных задач
 // и поддерживает расписание для регулярных рассылок.
-
 package notifications
 
 import (
@@ -23,24 +22,12 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-// warnIfLargeSize — эвристический порог, при превышении которого в лог пишется предупреждение
-// о накоплении задач. Значение 1000 выбрано, потому что очередь со стольким количеством
-// элементов уже требует внимания, но при этом не критично для памяти.
 const warnIfLargeSize = 1000
 
-// PreparedSender — транспорт доставки подготовленных заданий очереди.
-// Реализации обязаны обеспечивать идемпотентность (не повторять уже доставленное),
-// разумный троттлинг и стратегию ретраев. Опционально могут реализовывать
-// интерфейсы жизненного цикла Start/Stop и хук BeforeDrain.
 type PreparedSender interface {
 	Deliver(ctx context.Context, job Job) (SendOutcome, error)
 }
 
-// SendOutcome — результат попытки отправки одного задания.
-//   - PermanentFailures — список получателей, которым доставить нельзя (бан, 403 и т.п.);
-//   - PermanentError — агрегированное описание причины перманентного сбоя;
-//   - NetworkDown — транспорт сообщил об оффлайне; очередь приостановит дренирование и подождёт online;
-//   - Retry — рекомендовано повторить попытку позднее (например, 429).
 type SendOutcome struct {
 	PermanentFailures []filters.Recipient
 	PermanentError    error
@@ -48,8 +35,6 @@ type SendOutcome struct {
 	Retry             bool
 }
 
-// QueueOptions — зависимости и параметры очереди: транспорт, сторы, расписание, таймзона и часы.
-// Clock допускает внедрение монотонного времени в тестах; по умолчанию используется time.Now.
 type QueueOptions struct {
 	Sender   PreparedSender
 	Store    *QueueStore
@@ -60,38 +45,25 @@ type QueueOptions struct {
 	Peers    *peersmgr.Service
 }
 
-// scheduleEntry — нормализованный слот расписания в локальной таймзоне.
-// label хранит исходную строку (например, "09:30") для логирования.
 type scheduleEntry struct {
 	hour   int
 	minute int
 	label  string
 }
 
-// drainSignal — запрос на дренирование регулярной очереди.
-// preHookDone=true означает, что BeforeDrain уже вызван на продьюсер‑пути.
-type drainSignal struct {
-	reason      string
-	preHookDone bool
+type beforeDrainer interface {
+	BeforeDrain(context.Context)
 }
 
-// beforeDrainer объявляет необязательный хук транспорта, вызываемый перед началом дренирования.
-type beforeDrainer interface{ BeforeDrain(context.Context) }
-
-// QueueStats — снимок состояния для CLI/мониторинга.
-// Важно: NextScheduleAt возвращается в UTC; для отображения используйте Location.
 type QueueStats struct {
 	Urgent             int
 	Regular            int
 	LastRegularDrainAt time.Time
 	LastFlushAt        time.Time
-	NextScheduleAt     time.Time // в UTC
+	NextScheduleAt     time.Time
 	Location           *time.Location
 }
 
-// Queue — основная структура очереди уведомлений.
-// Хранит состояние в памяти, синхронизирует его с диском, управляет воркером
-// срочных задач и планировщиком регулярных. Потокобезопасность обеспечивается mutex.
 type Queue struct {
 	sender   PreparedSender
 	store    *QueueStore
@@ -104,7 +76,7 @@ type Queue struct {
 	state State
 
 	urgentCh  chan struct{}
-	regularCh chan drainSignal
+	regularCh chan string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -114,8 +86,6 @@ type Queue struct {
 	runOnce sync.Once
 }
 
-// NewQueue восстанавливает состояние из хранилища, парсит расписание, подготавливает каналы и зависимости.
-// Не запускает воркеры: для старта используйте Start(). Валидирует обязательные опции.
 func NewQueue(opts QueueOptions) (*Queue, error) {
 	if opts.Sender == nil {
 		return nil, errors.New("notifications queue: sender is nil")
@@ -150,29 +120,8 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		nowFn = time.Now
 	}
 
-	// Обработка старых Job при загрузке очереди
-	// Фильтруем старые невалидные Job'ы
-	validUrgent := []Job{}
-	validRegular := []Job{}
-
-	for _, job := range state.Urgent {
-		if job.Recipient.Type == "" || job.Recipient.PeerID == 0 {
-			logger.Errorf("Queue: skipping invalid urgent job %d (empty recipient)", job.ID)
-			continue
-		}
-		validUrgent = append(validUrgent, job)
-	}
-
-	for _, job := range state.Regular {
-		if job.Recipient.Type == "" || job.Recipient.PeerID == 0 {
-			logger.Errorf("Queue: skipping invalid regular job %d (empty recipient)", job.ID)
-			continue
-		}
-		validRegular = append(validRegular, job)
-	}
-
-	state.Urgent = validUrgent
-	state.Regular = validRegular
+	state.Urgent = filterValidJobs(state.Urgent)
+	state.Regular = filterValidJobs(state.Regular)
 
 	q := &Queue{
 		sender:    opts.Sender,
@@ -183,7 +132,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		peers:     opts.Peers,
 		state:     state,
 		urgentCh:  make(chan struct{}, 1),
-		regularCh: make(chan drainSignal, 1),
+		regularCh: make(chan string, 1),
 		now:       nowFn,
 	}
 
@@ -194,12 +143,21 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 	return q, nil
 }
 
-// Start запускает воркера и планировщик; повторный вызов безопасно игнорируется (runOnce).
-// При старте восстанавливает невыполненные urgent‑задачи и, если регулярное окно было пропущено
-// (LastRegularDrainAt < предыдущий слот), инициирует дренирование сразу.
+func filterValidJobs(jobs []Job) []Job {
+	n := 0
+	for _, job := range jobs {
+		if job.Recipient.Type != "" && job.Recipient.PeerID != 0 {
+			jobs[n] = job
+			n++
+		} else {
+			logger.Errorf("Queue: skipping invalid job %d (empty recipient)", job.ID)
+		}
+	}
+	return jobs[:n]
+}
+
 func (q *Queue) Start(ctx context.Context) {
 	q.runOnce.Do(func() {
-		// runOnce гарантирует, что очередь запустится только один раз даже при повторных вызовах.
 		q.ctx, q.cancel = context.WithCancel(ctx)
 		q.store.Start()
 		q.wg.Go(q.workerLoop)
@@ -207,33 +165,20 @@ func (q *Queue) Start(ctx context.Context) {
 
 		q.mu.Lock()
 		hasUrgent := len(q.state.Urgent) > 0
-		hasRegular := len(q.state.Regular) > 0
-		lastDrain := q.state.LastRegularDrainAt
 		q.mu.Unlock()
 
 		if hasUrgent {
 			logger.Infof("Queue: restoring %d urgent job(s) from disk", len(q.state.Urgent))
 			q.signalUrgent()
 		}
-		if hasRegular {
-			prevSlot := q.previousScheduleAt(q.now())
-			if lastDrain.IsZero() || lastDrain.Before(prevSlot) {
-				logger.Infof("Queue: missed window → draining")
-				q.signalRegularDrain("startup missed window")
-			}
-		}
 	})
 }
 
-// Run оставлен для обратной совместимости и просто вызывает Start().
 func (q *Queue) Run(ctx context.Context) {
 	q.Start(ctx)
 }
 
-// Close останавливает воркеры, вызывает Stop() у транспорта (если реализован),
-// и форсирует Flush/Close у стора. Блокируется до завершения горутин или таймаута ctx.
 func (q *Queue) Close(ctx context.Context) error {
-	q.store.Start()
 	if q.cancel != nil {
 		q.cancel()
 	}
@@ -252,18 +197,10 @@ func (q *Queue) Close(ctx context.Context) error {
 
 	if err := q.store.Flush(ctx); err != nil {
 		logger.Errorf("Queue: flush error: %v", err)
-		return err
 	}
-	if err := q.store.Close(ctx); err != nil {
-		logger.Errorf("Queue: store close error: %v", err)
-		return err
-	}
-	return nil
+	return q.store.Close(ctx)
 }
 
-// Notify формирует задания из результата фильтра и ставит их в очередь.
-// При флаге Forward добавляет спецификацию пересылки и, на всякий случай,
-// подготовленную копию текста (для транспорта без пересылки).
 func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.FilterMatchResult) error {
 	if msg == nil {
 		return errors.New("notifications queue: nil message")
@@ -272,9 +209,7 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 	link := BuildMessageLink(q.peers, entities, msg)
 	text := RenderTemplate(fres.Filter.Notify.Template, fres.Result, link)
 
-	payload := Payload{
-		Text: strings.TrimSpace(text),
-	}
+	payload := Payload{Text: strings.TrimSpace(text)}
 
 	if fres.Filter.Notify.Forward {
 		if fwd, err := buildForwardSpec(msg); err != nil {
@@ -282,15 +217,13 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 		} else {
 			payload.Forward = fwd
 		}
-		// Если требуется «форвард», а бот не умеет пересылать — подготовим копию текста для Bot API.
 		payload.Copy = BuildCopyTextFromTG(msg)
 	}
 
-	// Создаем Job'ы напрямую с filters.Recipient - вся информация уже есть
 	for _, r := range fres.Recipients {
 		job := Job{
 			Urgent:    fres.Filter.Notify.Urgent,
-			Recipient: r, // Используем полный filters.Recipient с TZ и Schedule
+			Recipient: r,
 			Payload:   payload,
 		}
 		jobID := q.enqueue(job)
@@ -302,11 +235,7 @@ func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.Filte
 	return nil
 }
 
-// enqueue присваивает job ID, сохраняет его в нужную очередь и планирует персист в фоне.
-// Возвращает присвоенный идентификатор. Для urgent дополнительно сигналит воркеру.
-// Теперь использует job.Recipient.CalculateScheduledTime() для персонального планирования.
 func (q *Queue) enqueue(job Job) int64 {
-	urgent := job.Urgent
 	now := q.now()
 
 	q.mu.Lock()
@@ -314,11 +243,9 @@ func (q *Queue) enqueue(job Job) int64 {
 	job.ID = q.state.NextID
 	job.CreatedAt = now.UTC()
 
-	// Вычисляем время отправки с учетом персональных настроек получателя
-	// Конвертируем глобальное schedule в строки для совместимости
 	defaultSchedule := make([]string, len(q.schedule))
 	for i, entry := range q.schedule {
-		defaultSchedule[i] = fmt.Sprintf("%02d:%02d", entry.hour, entry.minute)
+		defaultSchedule[i] = entry.label
 	}
 	job.ScheduledAt = job.Recipient.CalculateScheduledTime(job.Urgent, now, q.location, defaultSchedule)
 
@@ -342,14 +269,13 @@ func (q *Queue) enqueue(job Job) int64 {
 
 	q.warnIfLarge(urgentLen, regularLen)
 
-	if urgent {
+	if job.Urgent {
 		q.signalUrgent()
 	}
 
 	return jobID
 }
 
-// warnIfLarge логирует предупреждение при чрезмерном росте бэклогов.
 func (q *Queue) warnIfLarge(urgentLen, regularLen int) {
 	if urgentLen >= warnIfLargeSize {
 		logger.Warnf("Queue: urgent backlog reached %d tasks", urgentLen)
@@ -359,20 +285,17 @@ func (q *Queue) warnIfLarge(urgentLen, regularLen int) {
 	}
 }
 
-// Size возвращает текущие размеры urgent/regular бэклогов (без захвата снапшота состояния).
 func (q *Queue) Size() (int, int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.state.Urgent), len(q.state.Regular)
 }
 
-// HasPending сообщает, есть ли в очереди невыполненные задания любого типа.
 func (q *Queue) HasPending() bool {
 	u, r := q.Size()
 	return u > 0 || r > 0
 }
 
-// Stats возвращает компактный снимок состояния очереди для CLI/мониторинга.
 func (q *Queue) Stats() QueueStats {
 	q.mu.Lock()
 	urgent := len(q.state.Urgent)
@@ -393,154 +316,82 @@ func (q *Queue) Stats() QueueStats {
 	}
 }
 
-// workerLoop — главный цикл обработки сигналов. Приоритет: сначала завершение контекста,
-// затем срочные задачи, затем регулярное дренирование.
 func (q *Queue) workerLoop() {
 	for {
-		// Приоритет: сначала проверяем завершение контекста, затем срочные задачи,
-		// и только после этого обрабатываем сигнал расписания.
 		select {
 		case <-q.ctx.Done():
 			return
 		case <-q.urgentCh:
 			q.processUrgent()
-		case signal := <-q.regularCh:
-			q.processRegular(signal)
+		case reason := <-q.regularCh:
+			q.processRegular(reason)
 		}
 	}
 }
 
-// checkScheduledJobs проверяет регулярную очередь на наличие заданий, готовых к отправке.
-// Если находит готовые задания, инициирует дренирование регулярной очереди.
-func (q *Queue) checkScheduledJobs(now time.Time) {
+func (q *Queue) hasReadyJobs() bool {
 	q.mu.Lock()
-	hasReadyJobs := false
-	readyCount := 0
+	defer q.mu.Unlock()
 
-	// Проверяем регулярные задания на готовность к отправке
+	now := q.now()
 	for _, job := range q.state.Regular {
 		if !job.ScheduledAt.After(now) {
-			hasReadyJobs = true
-			readyCount++
+			return true
 		}
 	}
-
-	if hasReadyJobs {
-		logger.Debugf("Queue: found %d scheduled jobs ready at %s UTC",
-			readyCount, now.Format(time.RFC3339))
-		q.signalRegularDrain("scheduled jobs ready")
-	}
-	q.mu.Unlock()
+	return false
 }
 
-// schedulerLoop запускается каждую минуту и проверяет, есть ли задания готовые к отправке.
-// Заменяет старую логику расписания на персональную проверку времени отправки каждого задания.
-// Использует самокорректирующийся таймер для точного срабатывания в :00 секунд.
 func (q *Queue) schedulerLoop() {
-	// Первая проверка сразу при старте, чтобы обработать задания, которые могли быть пропущены
-	q.checkScheduledJobs(q.now())
-
 	for {
-		// Рассчитываем время до начала следующей минуты
+		if q.hasReadyJobs() {
+			q.signalRegularDrain("scheduled jobs ready")
+		}
+
 		now := q.now()
 		nextMinute := now.Truncate(time.Minute).Add(time.Minute)
 		sleepDuration := nextMinute.Sub(now)
 
-		// Создаем таймер, который сработает ровно в начале следующей минуты
 		timer := time.NewTimer(sleepDuration)
 
 		select {
 		case <-q.ctx.Done():
 			timer.Stop()
 			return
-		case tickTime := <-timer.C:
-			// Таймер сработал, сейчас примерно HH:MM:00
-			q.checkScheduledJobs(tickTime)
+		case <-timer.C:
 		}
 	}
 }
 
-// processUrgent дренирует срочную очередь до опустошения. Вызывает BeforeDrain у транспорта один раз.
 func (q *Queue) processUrgent() {
-	// Срочные задания обрабатываем до тех пор, пока в списке urgent есть элементы.
-	// Если в процессе доставки появятся новые urgent-задачи, сигнал urgentCh
-	// запустит цикл повторно.
-	hookCalled := false
-	for {
-		job, hasUrgent := q.popUrgent()
-		if !hasUrgent {
-			return
-		}
-		if !hookCalled {
-			if h, ok := q.sender.(interface{ BeforeDrain(context.Context) }); ok {
-				h.BeforeDrain(q.ctx)
-			}
-			hookCalled = true
-		}
-		if q.handleJob(job) {
-			return
-		}
-	}
-}
-
-// callBeforeDrainOnce вызывает BeforeDrain у sender ровно один раз за сессию дренирования.
-func (q *Queue) callBeforeDrainOnce(called *bool) {
-	if *called {
-		return
-	}
-	if h, okSender := q.sender.(beforeDrainer); okSender {
+	if h, ok := q.sender.(beforeDrainer); ok {
 		h.BeforeDrain(q.ctx)
 	}
-	*called = true
-}
-
-// drainUrgentOnce пытается обработать одно срочное задание перед каждым шагом регулярного дренирования.
-// Возвращает interrupted=true, если обработка потребовала прерывания регулярного дренирования
-// (requeue по сети/ctx), и processed=true, если срочное задание было и его попытались доставить.
-func (q *Queue) drainUrgentOnce(reason string, hookCalled *bool) (bool, bool) {
-	job, hasUrgent := q.popUrgent()
-	if !hasUrgent {
-		return false, false
-	}
-	q.callBeforeDrainOnce(hookCalled)
-	if q.handleJob(job) {
-		logger.Debugf("Queue: regular drain interrupted by urgent job (%s)", reason)
-		return true, false
-	}
-	return false, true
-}
-
-// processRegular дренирует регулярную очередь, учитывая возможные прерывания срочными задачами.
-// При полном опустошении фиксирует LastRegularDrainAt и синхронизирует состояние на диск.
-func (q *Queue) processRegular(sig drainSignal) {
-	reason := sig.reason
-	logger.Debugf("Queue: start regular drain (%s)", reason)
-
-	// drainedAll = true, если дошли до конца regular-очереди без прерываний
-	drainedAll := false
-	// Если пролог уже выполнен на продьюсер-пути, не дублируем.
-	hookCalled := sig.preHookDone
-
 	for {
-		// Сначала пробуем обработать одно срочное задание, если есть.
-		if interrupted, processed := q.drainUrgentOnce(reason, &hookCalled); interrupted {
-			break
-		} else if processed {
-			continue
+		job, hasJob := q.popUrgent()
+		if !hasJob {
+			return
 		}
-
-		job, hasRegular := q.popRegular()
-		if !hasRegular {
-			// Регулярная очередь исчерпана — окно считаем обработанным
-			drainedAll = true
-			break
-		}
-
-		q.callBeforeDrainOnce(&hookCalled)
-
 		if q.handleJob(job) {
-			// Принудительное прерывание дренирования (requeue / offline / ctx)
-			logger.Debugf("Queue: regular drain interrupted on job %d (%s)", job.ID, reason)
+			return
+		}
+	}
+}
+
+func (q *Queue) processRegular(reason string) {
+	logger.Debugf("Queue: start regular drain (%s)", reason)
+	if h, ok := q.sender.(beforeDrainer); ok {
+		h.BeforeDrain(q.ctx)
+	}
+
+	drainedAll := true
+	for {
+		job, hasJob := q.popRegular()
+		if !hasJob {
+			break
+		}
+		if q.handleJob(job) {
+			drainedAll = false
 			break
 		}
 	}
@@ -554,32 +405,27 @@ func (q *Queue) processRegular(sig drainSignal) {
 	logger.Debugf("Queue: regular drain finished (%s)", reason)
 }
 
-// handleJob выполняет доставку одного задания и решает, нужно ли прервать текущую выборку.
-// Возвращает true, если задание было возвращено в очередь или потребовалось ждать online/ctx.
 func (q *Queue) handleJob(job Job) bool {
 	start := q.now()
 	logger.Debugf("Queue: delivering job %d (urgent=%t recipient=%s:%d)",
 		job.ID, job.Urgent, job.Recipient.Type, job.Recipient.PeerID)
 
-	ctx := q.ctx
-	result, err := q.sender.Deliver(ctx, job)
-
-	// Если transport сообщил, что соединение разорвано, возвращаем задание в начало очереди.
-	// Блокирующее ожидание убрано в пользу повторной попытки при следующем запуске планировщика.
-	if result.NetworkDown {
-		logger.Warnf("Queue: network offline, requeue job %d", job.ID)
-		q.requeueJob(job, true)
-		return true
-	}
+	result, err := q.sender.Deliver(q.ctx, job)
 
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			logger.Warnf("Queue: context canceled while delivering job %d, requeue", job.ID)
+			logger.Warnf("Queue: context canceled, requeue job %d", job.ID)
 			q.requeueJob(job, true)
 			return true
 		}
 		logger.Errorf("Queue: delivery error for job %d: %v", job.ID, err)
 		q.requeueJob(job, false)
+		return true
+	}
+
+	if result.NetworkDown {
+		logger.Warnf("Queue: network offline, requeue job %d", job.ID)
+		q.requeueJob(job, true)
 		return true
 	}
 
@@ -589,7 +435,6 @@ func (q *Queue) handleJob(job Job) bool {
 		return true
 	}
 
-	// Перманентные ошибки фиксируем в отдельном файле failed, чтобы оператор мог расследовать инцидент.
 	if len(result.PermanentFailures) > 0 {
 		errMsg := "permanent failure"
 		if result.PermanentError != nil {
@@ -613,8 +458,6 @@ func (q *Queue) handleJob(job Job) bool {
 	return false
 }
 
-// requeueJob возвращает задание обратно в соответствующую очередь, сохраняя его исходное время.
-// front=true — поставить в начало.
 func (q *Queue) requeueJob(job Job, front bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -634,14 +477,11 @@ func (q *Queue) requeueJob(job Job, front bool) {
 
 	q.persistLocked()
 
-	// Сигнализируем только для срочных задач, чтобы немедленно их обработать.
-	// Для обычных задач ждем следующего тика планировщика.
 	if job.Urgent {
 		q.signalUrgent()
 	}
 }
 
-// popUrgent снимает первое срочное задание, обновляет состояние и планирует persist.
 func (q *Queue) popUrgent() (Job, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -655,35 +495,27 @@ func (q *Queue) popUrgent() (Job, bool) {
 	return job, true
 }
 
-// popRegular снимает первое готовое к отправке регулярное задание, обновляет состояние и планирует persist.
-// Теперь проверяет ScheduledAt и возвращает задание только если время отправки наступило.
 func (q *Queue) popRegular() (Job, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	now := q.now()
-
-	// Ищем первое готовое к отправке задание
 	for i, job := range q.state.Regular {
 		if !job.ScheduledAt.After(now) {
-			// Задание готово к отправке - удаляем из очереди
 			q.state.Regular = append(q.state.Regular[:i], q.state.Regular[i+1:]...)
 			q.persistLocked()
 			return job, true
 		}
 	}
 
-	// Нет готовых заданий
 	return Job{}, false
 }
 
-// persistLocked помечает время последней синхронизации и планирует запись состояния (без блокировки диска здесь).
 func (q *Queue) persistLocked() {
 	q.state.LastFlushAt = q.now().UTC()
 	q.store.SchedulePersist(q.state.Clone())
 }
 
-// signalUrgent пробует неблокирующе уведомить воркер о наличии срочных задач.
 func (q *Queue) signalUrgent() {
 	select {
 	case q.urgentCh <- struct{}{}:
@@ -691,20 +523,13 @@ func (q *Queue) signalUrgent() {
 	}
 }
 
-// signalRegularDrain отправляет неблокирующий сигнал на дренирование регулярной очереди.
 func (q *Queue) signalRegularDrain(reason string) {
-	// Выполним «человечный» пролог на продьюсер-пути (только для транспортов, которые его поддерживают).
-	if h, ok := q.sender.(interface{ BeforeDrain(context.Context) }); ok {
-		h.BeforeDrain(q.ctx)
-	}
-	req := drainSignal{reason: reason, preHookDone: true}
 	select {
-	case q.regularCh <- req:
+	case q.regularCh <- reason:
 	default:
 	}
 }
 
-// FlushImmediately инициирует внеплановый слив регулярной очереди из CLI/оператора (неблокирующе).
 func (q *Queue) FlushImmediately(reason string) {
 	if reason == "" {
 		reason = "manual flush"
@@ -712,11 +537,9 @@ func (q *Queue) FlushImmediately(reason string) {
 	q.signalRegularDrain(reason)
 }
 
-// nextScheduleAfter вычисляет следующий слот расписания в локальной таймзоне и возвращает его в UTC.
 func (q *Queue) nextScheduleAfter(now time.Time) time.Time {
 	if len(q.schedule) == 0 {
-		logger.Errorf("Queue: empty schedule detected, falling back to +1 hour")
-		return now.Add(time.Hour).UTC()
+		return now.Add(time.Hour)
 	}
 
 	localNow := now.In(q.location)
@@ -729,40 +552,12 @@ func (q *Queue) nextScheduleAfter(now time.Time) time.Time {
 		}
 	}
 
-	// все слоты прошли → берём первое время следующего дня
 	first := q.schedule[0]
-	nextDay := today.Add(24 * time.Hour) //nolint: mnd // next day
-	next := time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(), first.hour, first.minute, 0, 0, q.location)
-	return next.UTC()
+	const dayDuration = 24 * time.Hour
+	nextDay := today.Add(dayDuration)
+	return time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(), first.hour, first.minute, 0, 0, q.location).UTC()
 }
 
-// previousScheduleAt возвращает предыдущий слот расписания относительно now в локальной таймзоне (результат в UTC).
-func (q *Queue) previousScheduleAt(now time.Time) time.Time {
-	if len(q.schedule) == 0 {
-		logger.Errorf("Queue: empty schedule detected in previousScheduleAt, falling back to -1 hour")
-		return now.Add(-time.Hour).UTC()
-	}
-
-	localNow := now.In(q.location)
-	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, q.location)
-
-	// Идём с конца, чтобы найти ближайший slot <= now в сегодняшнем дне
-	for i := len(q.schedule) - 1; i >= 0; i-- {
-		entry := q.schedule[i]
-		slot := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), entry.hour, entry.minute, 0, 0, q.location)
-		if slot.Before(localNow) {
-			return slot.UTC()
-		}
-	}
-
-	// Нет слотов ранее в текущий день → берём последний слот вчера
-	last := q.schedule[len(q.schedule)-1]
-	yesterday := today.Add(-24 * time.Hour)
-	prev := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), last.hour, last.minute, 0, 0, q.location)
-	return prev.UTC()
-}
-
-// buildForwardSpec готовит спецификацию пересылки исходного сообщения.
 func buildForwardSpec(msg *tg.Message) (*ForwardSpec, error) {
 	if msg == nil {
 		return nil, errors.New("message is nil")
@@ -778,42 +573,32 @@ func buildForwardSpec(msg *tg.Message) (*ForwardSpec, error) {
 	}, nil
 }
 
-// peerToRecipient преобразует tg.PeerClass в доменную сущность filters.Recipient.
 func peerToRecipient(peer tg.PeerClass) (filters.Recipient, error) {
 	switch v := peer.(type) {
 	case *tg.PeerUser:
-		return filters.Recipient{
-			Type:   filters.RecipientTypeUser,
-			PeerID: filters.RecipientPeerID(v.UserID),
-		}, nil
+		return filters.Recipient{Type: filters.RecipientTypeUser, PeerID: filters.RecipientPeerID(v.UserID)}, nil
 	case *tg.PeerChat:
-		return filters.Recipient{
-			Type:   filters.RecipientTypeChat,
-			PeerID: filters.RecipientPeerID(v.ChatID),
-		}, nil
+		return filters.Recipient{Type: filters.RecipientTypeChat, PeerID: filters.RecipientPeerID(v.ChatID)}, nil
 	case *tg.PeerChannel:
-		return filters.Recipient{
-			Type:   filters.RecipientTypeChannel,
-			PeerID: filters.RecipientPeerID(v.ChannelID),
-		}, nil
+		return filters.Recipient{Type: filters.RecipientTypeChannel, PeerID: filters.RecipientPeerID(v.ChannelID)}, nil
 	default:
 		return filters.Recipient{}, fmt.Errorf("unsupported peer type %T", peer)
 	}
 }
 
-// parseSchedule принимает список токенов "HH:MM", валидирует диапазоны и сортирует слоты по времени.
 func parseSchedule(raw []string) ([]scheduleEntry, error) {
 	entries := make([]scheduleEntry, 0, len(raw))
 	for _, token := range raw {
 		parts := strings.Split(token, ":")
-		if len(parts) != 2 { //nolint: mnd // why not?
+		const expectedParts = 2
+		if len(parts) != expectedParts {
 			return nil, fmt.Errorf("invalid schedule token %q", token)
 		}
-		hour, err := strconvAtoi(parts[0])
+		hour, err := strconv.Atoi(parts[0])
 		if err != nil {
 			return nil, fmt.Errorf("invalid hour in %q: %w", token, err)
 		}
-		minute, err := strconvAtoi(parts[1])
+		minute, err := strconv.Atoi(parts[1])
 		if err != nil {
 			return nil, fmt.Errorf("invalid minute in %q: %w", token, err)
 		}
@@ -835,13 +620,4 @@ func parseSchedule(raw []string) ([]scheduleEntry, error) {
 	})
 
 	return entries, nil
-}
-
-// strconvAtoi — Atoi с защитой от пустых строк и лишних пробелов.
-func strconvAtoi(value string) (int, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, errors.New("empty value")
-	}
-	return strconv.Atoi(value)
 }
