@@ -436,35 +436,26 @@ func (q *Queue) checkScheduledJobs(now time.Time) {
 
 // schedulerLoop запускается каждую минуту и проверяет, есть ли задания готовые к отправке.
 // Заменяет старую логику расписания на персональную проверку времени отправки каждого задания.
-// Синхронизируется с началом системных минут для точного срабатывания в :00 секунд.
+// Использует самокорректирующийся таймер для точного срабатывания в :00 секунд.
 func (q *Queue) schedulerLoop() {
-	// Синхронизируемся с началом следующей минуты
-	now := q.now()
-	nextMinute := now.Truncate(time.Minute).Add(time.Minute)
-	sleepDuration := nextMinute.Sub(now)
-
-	logger.Debugf("Queue: scheduler will start at %s UTC (sleeping %v)",
-		nextMinute.Format(time.RFC3339), sleepDuration)
-
-	// Ждем до начала следующей минуты
-	select {
-	case <-q.ctx.Done():
-		return
-	case <-time.After(sleepDuration):
-	}
-
-	// Теперь ticker будет срабатывать точно в :00 секунд каждой минуты
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	// Первая проверка сразу после синхронизации
+	// Первая проверка сразу при старте, чтобы обработать задания, которые могли быть пропущены
 	q.checkScheduledJobs(q.now())
 
 	for {
+		// Рассчитываем время до начала следующей минуты
+		now := q.now()
+		nextMinute := now.Truncate(time.Minute).Add(time.Minute)
+		sleepDuration := nextMinute.Sub(now)
+
+		// Создаем таймер, который сработает ровно в начале следующей минуты
+		timer := time.NewTimer(sleepDuration)
+
 		select {
 		case <-q.ctx.Done():
+			timer.Stop()
 			return
-		case tickTime := <-ticker.C:
+		case tickTime := <-timer.C:
+			// Таймер сработал, сейчас примерно HH:MM:00
 			q.checkScheduledJobs(tickTime)
 		}
 	}

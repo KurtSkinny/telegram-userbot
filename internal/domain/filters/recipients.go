@@ -103,35 +103,19 @@ func (rt *RecipientTZ) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type RecipientSchedule struct {
-	Hour   int
-	Minute int
-	Label  string
-}
+type RecipientSchedule string
 
-// UnmarshalJSON реализует кастомную десериализацию для RecipientSchedule
+// UnmarshalJSON реализует проверку на валидность формата HH:MM
 func (rs *RecipientSchedule) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
 	s = strings.TrimSpace(s)
-	if s == "" {
-		*rs = RecipientSchedule{}
-		return nil
-	}
-	if !IsValidScheduleEntry(s) {
+	if s != "" && !IsValidScheduleEntry(s) {
 		return fmt.Errorf("invalid schedule entry: %s", s)
 	}
-
-	parts := strings.Split(s, ":")
-	hour, _ := strconv.Atoi(parts[0])
-	minute, _ := strconv.Atoi(parts[1])
-	*rs = RecipientSchedule{
-		Hour:   hour,
-		Minute: minute,
-		Label:  s,
-	}
+	*rs = RecipientSchedule(s)
 	return nil
 }
 
@@ -254,7 +238,7 @@ func (r *Recipient) CalculateScheduledTime(
 	if len(r.Schedule) > 0 {
 		schedule = make([]string, len(r.Schedule))
 		for i, s := range r.Schedule {
-			schedule[i] = s.Label
+			schedule[i] = string(s)
 		}
 	}
 
