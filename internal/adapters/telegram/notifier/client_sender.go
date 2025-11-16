@@ -80,6 +80,14 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	recipient := job.Recipient
 	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type.String(), int64(recipient.PeerID))
 	if errPeer != nil {
+		// Сначала проверяем, является ли ошибка сетевой.
+		if connection.HandleError(errPeer) {
+			outcome.NetworkDown = true
+			// Возвращаем nil в качестве ошибки, чтобы очередь обработала это как временный сбой.
+			return outcome, nil
+		}
+
+		// Если это не сетевая ошибка, считаем ее постоянной проблемой с получателем.
 		logger.Errorf("ClientSender: resolve peer %s:%d failed: %v", recipient.Type, recipient.PeerID, errPeer)
 		outcome.PermanentFailures = append(outcome.PermanentFailures, recipient)
 		outcome.PermanentError = errors.Join(outcome.PermanentError, errPeer)

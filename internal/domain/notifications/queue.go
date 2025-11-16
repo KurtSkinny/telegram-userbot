@@ -18,7 +18,6 @@ import (
 
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
 
 	"github.com/gotd/td/tg"
@@ -565,15 +564,11 @@ func (q *Queue) handleJob(job Job) bool {
 	ctx := q.ctx
 	result, err := q.sender.Deliver(ctx, job)
 
-	// Если transport сообщил, что соединение разорвано, возвращаем задание в начало очереди
-	// и ждём, пока connection.WaitOnline не подтвердит восстановление.
+	// Если transport сообщил, что соединение разорвано, возвращаем задание в начало очереди.
+	// Блокирующее ожидание убрано в пользу повторной попытки при следующем запуске планировщика.
 	if result.NetworkDown {
 		logger.Warnf("Queue: network offline, requeue job %d", job.ID)
 		q.requeueJob(job, true)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			logger.Warnf("Queue: job %d waiting for connection but context already done: %v", job.ID, ctxErr)
-		}
-		connection.WaitOnline(ctx)
 		return true
 	}
 

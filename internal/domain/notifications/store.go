@@ -78,7 +78,7 @@ func ensureStateFile(path string) (State, error) {
 	bytes, errRead := os.ReadFile(clean)
 	if os.IsNotExist(errRead) || len(bytes) == 0 {
 		st := DefaultState()
-		b, errJSON := json.MarshalIndent(st, "", "  ") //nolint:musttag // struct has json tags
+		b, errJSON := json.MarshalIndent(st, "", "  ")
 		if errJSON != nil {
 			return DefaultState(), fmt.Errorf("encode default queue state: %w", errJSON)
 		}
@@ -96,7 +96,7 @@ func ensureStateFile(path string) (State, error) {
 	if errUnmarsh := json.Unmarshal(bytes, &st); errUnmarsh != nil {
 		logger.Warnf("QueueStore: failed to decode %s: %v; rewriting default", clean, errUnmarsh)
 		st = DefaultState()
-		b, errJSON := json.MarshalIndent(st, "", "  ") //nolint:musttag // struct has json tags
+		b, errJSON := json.MarshalIndent(st, "", "  ")
 		if errJSON != nil {
 			return DefaultState(), fmt.Errorf("encode default queue state: %w", errJSON)
 		}
@@ -121,7 +121,7 @@ func ensureStateFile(path string) (State, error) {
 		fixed = true
 	}
 	if fixed {
-		b, errJSON := json.MarshalIndent(st, "", "  ") //nolint:musttag // struct has json tags
+		b, errJSON := json.MarshalIndent(st, "", "  ")
 		if errJSON != nil {
 			return st, fmt.Errorf("encode fixed queue state: %w", errJSON)
 		}
@@ -330,7 +330,7 @@ func (s *FailedStore) Append(records ...FailedRecord) error {
 		existing = append(existing, record.Clone())
 	}
 
-	data, errJSON := json.MarshalIndent(existing, "", "  ") //nolint:musttag // struct has json tags
+	data, errJSON := json.MarshalIndent(existing, "", "  ")
 	if errJSON != nil {
 		return fmt.Errorf("encode failed store: %w", errJSON)
 	}
@@ -344,7 +344,7 @@ func (s *FailedStore) Append(records ...FailedRecord) error {
 
 // writeState кодирует state в JSON и атомарно записывает на диск. Логирует размеры очередей.
 func (s *QueueStore) writeState(state State) error {
-	data, errJSON := json.MarshalIndent(state, "", "  ") //nolint:musttag // struct has json tags
+	data, errJSON := json.MarshalIndent(state, "", "  ")
 	if errJSON != nil {
 		logger.Errorf("QueueStore: marshal error: %v", errJSON)
 		return fmt.Errorf("encode queue state: %w", errJSON)
