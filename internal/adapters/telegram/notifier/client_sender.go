@@ -75,7 +75,10 @@ func (s *ClientSender) Deliver(ctx context.Context, job notifications.Job) (noti
 	recipient := job.Recipient
 	peer, errPeer := s.peers.InputPeerByKind(ctx, recipient.Type.String(), int64(recipient.PeerID))
 	if errPeer != nil {
-		// Сначала проверяем, является ли ошибка сетевой.
+		if errors.Is(errPeer, context.Canceled) || errors.Is(errPeer, context.DeadlineExceeded) {
+			return outcome, errPeer
+		}
+
 		if connection.HandleError(errPeer) {
 			outcome.NetworkDown = true
 			// Возвращаем nil в качестве ошибки, чтобы очередь обработала это как временный сбой.

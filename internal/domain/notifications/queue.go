@@ -174,27 +174,13 @@ func (q *Queue) Start(ctx context.Context) {
 	})
 }
 
-func (q *Queue) Stop(ctx context.Context) error {
+func (q *Queue) Stop() error {
 	if q.cancel != nil {
 		q.cancel()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		q.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	if err := q.store.Flush(ctx); err != nil {
-		logger.Errorf("Queue: flush error: %v", err)
-	}
-	return q.store.Close(ctx)
+	q.wg.Wait()
+	return q.store.Stop()
 }
 
 func (q *Queue) Notify(entities tg.Entities, msg *tg.Message, fres filters.FilterMatchResult) error {

@@ -5,7 +5,6 @@
 package notifications
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +36,8 @@ type QueueStore struct {
 	updates chan State
 	flushCh chan flushRequest
 	stopCh  chan struct{}
-	doneCh  chan struct{}
 
+	wg        sync.WaitGroup
 	startOnce sync.Once
 	closeOnce sync.Once
 	finalErr  error
@@ -59,7 +58,6 @@ func NewQueueStore(path string, debounce time.Duration) (*QueueStore, error) {
 		updates:  make(chan State, 1),
 		flushCh:  make(chan flushRequest),
 		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
 	}
 	return store, nil
 }
@@ -135,8 +133,21 @@ func ensureStateFile(path string) (State, error) {
 // Start запускает фоновую горутину persist-воркера. Повторные вызовы безопасно игнорируются.
 func (s *QueueStore) Start() {
 	s.startOnce.Do(func() {
-		go s.loop()
+		s.wg.Go(func() {
+			s.loop()
+		})
 	})
+}
+
+// Stop корректно завершает фоновую запись и дожидается её окончания.
+// Все отложенные записи будут выполнены. Возвращает первую ошибку записи, если была.
+func (s *QueueStore) Stop() error {
+	s.closeOnce.Do(func() {
+		close(s.stopCh)
+	})
+
+	s.wg.Wait()
+	return s.finalError()
 }
 
 // Load читает текущий снимок состояния из файла, при необходимости лечит его через ensureStateFile().
@@ -168,42 +179,9 @@ func (s *QueueStore) SchedulePersist(state State) {
 	}
 }
 
-// Flush блокируется до завершения последней отложенной записи или отмены ctx.
-// Используйте перед остановкой очереди.
-func (s *QueueStore) Flush(ctx context.Context) error {
-	req := flushRequest{reply: make(chan error, 1)}
-	select {
-	case <-s.stopCh:
-		return errors.New("queue store is closed")
-	case s.flushCh <- req:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case err := <-req.reply:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// Close останавливает воркер и дожидается завершения. Возвращает первую ошибку записи, если была.
-func (s *QueueStore) Close(ctx context.Context) error {
-	s.closeOnce.Do(func() {
-		close(s.stopCh)
-	})
-	select {
-	case <-s.doneCh:
-		return s.finalError()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 // loop — главный цикл: накапливает pending, перезапускает таймер дебаунса,
 // пишет снапшот по таймеру, по Flush или на остановке. Все записи идут через writeState().
 func (s *QueueStore) loop() {
-	defer close(s.doneCh)
 	var (
 		pending *State
 		timer   *time.Timer
@@ -245,7 +223,7 @@ func (s *QueueStore) loop() {
 	}
 }
 
-// stopAndDrainTimer останавливает таймер и съедает возможный спурионный тик, чтобы select не дернулся позже.
+// stopAndDrainTimer останавливает таймер и осушает его канал, если нужно.
 func stopAndDrainTimer(t *time.Timer) {
 	if t == nil {
 		return

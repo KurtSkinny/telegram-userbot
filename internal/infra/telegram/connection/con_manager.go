@@ -121,6 +121,16 @@ func MarkDisconnected() {
 	}
 }
 
+// IsOffline возвращает true, если глобальный менеджер инициализирован и
+// находится в состоянии offline. Если менеджер не инициализирован, возвращает false.
+func IsOffline() bool {
+	m := getManager()
+	if m == nil {
+		return false
+	}
+	return !m.connected.Load()
+}
+
 // WaitOnline блокирует вызывающую горутину до восстановления соединения или отмены
 // контекста. Если уже online, возвращает сразу. Логика использует «снимки» канала
 // ожидания: если мы проснулись по старому закрытому каналу, цикл продолжится до
@@ -411,6 +421,10 @@ func isNetworkError(err error) bool {
 		return false
 	}
 
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
 	if errors.Is(err, pool.ErrConnDead) {
 		return true
 	}
@@ -419,9 +433,6 @@ func isNetworkError(err error) bool {
 	}
 	var retryErr *rpc.RetryLimitReachedErr
 	if errors.As(err, &retryErr) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	if errors.Is(err, io.EOF) {

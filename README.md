@@ -290,7 +290,6 @@ internal/
   infra/
     telegram/{connection,status,runtime,cache}  # соединение, статус, утилиты
     throttle/                    # троттлер и backoff
-    lifecycle/                   # менеджер запуска/остановки сервисов
     storage/                     # EnsureDir, AtomicWriteFile
     logger/, pr/                 # логгер и интеграция с readline
   support/

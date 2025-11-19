@@ -24,7 +24,7 @@ func DoTypingWaitMs(ctx context.Context, peer tg.InputPeerClass, minMs, maxMs in
 	}
 	// Добавляем хвост, чтобы аккаунт не выключал online ровно в момент окончания печати.
 	deltaMs := shared.Random(deltaMinMs, deltaMaxMs)
-	GoOnlineMinMs(deltaMs+minMs, deltaMs+maxMs)
+	goOnlineInterval(deltaMs+minMs, deltaMs+maxMs)
 	// Включаем typing через API; ошибки намеренно глотаем — это косметика.
 	_, _ = manager.api.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
 		Peer:   peer,

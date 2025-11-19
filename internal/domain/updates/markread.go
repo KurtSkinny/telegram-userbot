@@ -74,12 +74,15 @@ func (h *Handlers) runMarkReadScheduler(ctx context.Context) {
 	}
 }
 
-// flushUnread достаёт накопленные «непрочитанные» из h.unread под мьютексом,
-// пытается разрешить для них inputPeer и, уже без блокировки, последовательно
-// отмечает чаты как прочитанные, соблюдая случайные задержки между вызовами.
-// Ошибки разрешения пиров логируются и не блокируют обработку остальных.
-func (h *Handlers) flushUnread(ctx context.Context) {
+// getMessagesToMarkread собирает из локального кэша h.unread срез сообщений,
+// которые нужно пометить как прочитанные. Для каждого peerID выбирается
+// сообщение с максимальным msgID. Если peers менеджер доступен, пытается
+// разрешить InputPeer для каждого сообщения; в случае неудачи логирует ошибку
+// и пропускает сообщение. Возвращает срез подготовленных сообщений.
+func (h *Handlers) getMessagesToMarkread(ctx context.Context) []*tg.Message {
 	h.unreadMu.Lock()
+	defer h.unreadMu.Unlock()
+
 	// Собираем срез сообщений-кандидатов и общий Entities-контейнер для разрешения через peers менеджер.
 	messages := []*tg.Message{}
 
@@ -115,6 +118,9 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 				break
 			} else {
 				lastErr = err
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil
+				}
 			}
 		}
 
@@ -124,16 +130,24 @@ func (h *Handlers) flushUnread(ctx context.Context) {
 			logger.Errorf("markRead: failed to resolve peer %d: %v", peerID, lastErr)
 		}
 	}
-	h.unreadMu.Unlock()
-	// Дальше только сетевые операции — выполняем их без удержания мьютекса.
+	return messages
+}
 
-	// logger.Warn(pr.Pf(messages))
+// flushUnread проходит по накопленным непрочитанным сообщениям в локальном кэше h.unread,
+// и для каждого инициирует их пометку как прочитанных с реалистичными задержками.
+// Перед серией сетевых вызовов дожидается онлайна и кратко «засвечивает» активность.
+// Если нет сообщений для пометки, просто возвращается.
+func (h *Handlers) flushUnread(ctx context.Context) {
+	if connection.IsOffline() {
+		return
+	}
+
+	messages := h.getMessagesToMarkread(ctx)
+
 	if len(messages) == 0 {
 		return
 	}
 
-	// Перед серией сетевых вызовов убеждаемся, что клиент онлайн, и кратко «засветим» активность.
-	connection.WaitOnline(ctx)
 	status.GoOnline()
 	// Небольшая задержка перед первым запросом, чтобы не выглядеть как бот-триггер.
 	tgruntime.WaitRandomTimeMs(ctx, readDelayMinMs, readDelayMaxMs)
@@ -164,6 +178,9 @@ func (h *Handlers) markRead(ctx context.Context, msg *tg.Message) {
 	}
 	peer, pErr := h.peers.InputPeerFromMessage(ctx, msg)
 	if pErr != nil {
+		if errors.Is(pErr, context.Canceled) || errors.Is(pErr, context.DeadlineExceeded) {
+			return
+		}
 		logger.Errorf("markRead: get input peer failed: %v", pErr)
 		return
 	}
@@ -177,6 +194,9 @@ func (h *Handlers) markRead(ctx context.Context, msg *tg.Message) {
 			Peer:  p,
 			MaxID: msg.ID,
 		}); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
 			connection.HandleError(err)
 			logger.Errorf("markRead: Messages.readHistory failed: %v", err.Error())
 		} else {
@@ -192,6 +212,9 @@ func (h *Handlers) markRead(ctx context.Context, msg *tg.Message) {
 			Channel: ch,
 			MaxID:   msg.ID,
 		}); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
 			connection.HandleError(err)
 			logger.Errorf("markRead: channels.readHistory failed: %v", err.Error())
 		} else {
