@@ -18,11 +18,11 @@ import (
 
 const offlineGraceTimeout = 10 * time.Second
 
-// StatusManager управляет онлайн-статусом пользователя в Telegram.
+// statusManager управляет онлайн-статусом пользователя в Telegram.
 // Реагирует на сигналы активности (пинги) и поддерживает аккаунт в online,
 // а при отсутствии активности уводит в offline по таймауту.
 // Также предоставляет методы для эмуляции статуса "печатает".
-type StatusManager struct {
+type statusManager struct {
 	api    *tg.Client
 	pingCh chan int      // Буферизованный канал сигналов активности (пинги)
 	doneCh chan struct{} // Канал для сигнализации о завершении работы менеджера
@@ -30,7 +30,7 @@ type StatusManager struct {
 
 // Глобальное хранение синглтона менеджера и его cancel-функции. Доступ защищён mutex-ом.
 var (
-	manager *StatusManager // manager хранит глобальный экземпляр менеджера статуса для всего процесса
+	manager *statusManager // manager хранит глобальный экземпляр менеджера статуса для всего процесса
 
 	statusWg     sync.WaitGroup
 	statusMu     sync.Mutex
@@ -49,7 +49,7 @@ func Start(ctx context.Context, api *tg.Client) {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	// Отдельный под-контекст, чтобы можно было целенаправленно гасить менеджер из Shutdown().
-	manager = &StatusManager{
+	manager = &statusManager{
 		api:    api,
 		pingCh: make(chan int, 1),
 		doneCh: make(chan struct{}),
@@ -84,7 +84,7 @@ func Stop() {
 // ping сообщает менеджеру о свежей активности. Сбрасывает таймер простоя и удерживает online.
 // Канал буферизован на 1 элемент, поэтому всплески пингов схлопываются до одного сигнала.
 // Конкурентно безопасно; при заполненном буфере новый сигнал игнорируется без потери актуальности.
-func (m *StatusManager) ping(wait int) {
+func (m *statusManager) ping(wait int) {
 	select {
 	case m.pingCh <- wait:
 	default:
@@ -161,7 +161,7 @@ func randomMs(minMs, maxMs int) int {
 // setOnline переводит статус в online, если последний апдейт был более минуты назад.
 // Это снижает шум AccountUpdateStatus при частых пингах. Пытается дождаться соединения и
 // вызывает AccountUpdateStatus(ctx, false). Обновляет online и lastOnlineAt по успешному вызову.
-func (m *StatusManager) setOnline(ctx context.Context, online *bool, lastOnlineAt *time.Time) {
+func (m *statusManager) setOnline(ctx context.Context, online *bool, lastOnlineAt *time.Time) {
 	if online == nil || lastOnlineAt == nil || m == nil {
 		return
 	}
@@ -184,7 +184,7 @@ func (m *StatusManager) setOnline(ctx context.Context, online *bool, lastOnlineA
 
 // setOffline переводит аккаунт в offline. Если исходный ctx уже отменён или причина — "context cancel",
 // создаёт краткий фоновый контекст с таймаутом offlineGraceTimeout, чтобы успеть отправить запрос на shutdown.
-func (m *StatusManager) setOffline(ctx context.Context, reason string, online *bool) {
+func (m *statusManager) setOffline(ctx context.Context, reason string, online *bool) {
 	if online == nil || m == nil {
 		return
 	}
@@ -214,7 +214,7 @@ func (m *StatusManager) setOffline(ctx context.Context, reason string, online *b
 // run управляет жизненным циклом статуса: реагирует на pingCh, включает online и по таймеру уходит в offline.
 // На завершение контекста пытается аккуратно отправить offline и закрывает doneCh. Перед Reset таймера всегда
 // выполняется drain его канала, чтобы избежать спурионных тиков.
-func (m *StatusManager) run(ctx context.Context) {
+func (m *statusManager) run(ctx context.Context) {
 	online := false
 	lastOnlineAt := time.Now()
 	timer := time.NewTimer(time.Hour)

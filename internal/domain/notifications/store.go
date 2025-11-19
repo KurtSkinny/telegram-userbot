@@ -188,6 +188,8 @@ func (s *QueueStore) loop() {
 		timerC  <-chan time.Time
 	)
 
+	defer logger.Debug("QueueStore: loop exited")
+
 	for {
 		select {
 		case state := <-s.updates:

@@ -288,6 +288,7 @@ func (q *Queue) Stats() QueueStats {
 }
 
 func (q *Queue) workerLoop() {
+	defer logger.Debug("Queue: worker loop exited")
 	for {
 		select {
 		case <-q.ctx.Done():
@@ -314,6 +315,7 @@ func (q *Queue) hasReadyJobs() bool {
 }
 
 func (q *Queue) schedulerLoop() {
+	defer logger.Debug("Queue: scheduler loop exited")
 	for {
 		if q.hasReadyJobs() {
 			q.signalRegularDrain("scheduled jobs ready")
