@@ -19,9 +19,9 @@ import (
 
 // flushRequest используется воркером для синхронного завершения отложенной записи.
 // Канал reply получает итог ошибки consumePending().
-type flushRequest struct {
-	reply chan error
-}
+// type flushRequest struct {
+// 	reply chan error
+// }
 
 // QueueStore — фоновый сервис персиста состояния очереди в JSON.
 // Особенности:
@@ -34,14 +34,11 @@ type QueueStore struct {
 	debounce time.Duration
 
 	updates chan State
-	flushCh chan flushRequest
 	stopCh  chan struct{}
 
-	wg        sync.WaitGroup
-	startOnce sync.Once
-	closeOnce sync.Once
-	finalErr  error
-	errMu     sync.Mutex
+	wg       sync.WaitGroup
+	finalErr error
+	errMu    sync.Mutex
 }
 
 // NewQueueStore подготавливает файловое хранилище: нормализует путь,
@@ -56,7 +53,6 @@ func NewQueueStore(path string, debounce time.Duration) (*QueueStore, error) {
 		path:     clean,
 		debounce: debounce,
 		updates:  make(chan State, 1),
-		flushCh:  make(chan flushRequest),
 		stopCh:   make(chan struct{}),
 	}
 	return store, nil
@@ -132,20 +128,15 @@ func ensureStateFile(path string) (State, error) {
 
 // Start запускает фоновую горутину persist-воркера. Повторные вызовы безопасно игнорируются.
 func (s *QueueStore) Start() {
-	s.startOnce.Do(func() {
-		s.wg.Go(func() {
-			s.loop()
-		})
+	s.wg.Go(func() {
+		s.loop()
 	})
 }
 
 // Stop корректно завершает фоновую запись и дожидается её окончания.
 // Все отложенные записи будут выполнены. Возвращает первую ошибку записи, если была.
 func (s *QueueStore) Stop() error {
-	s.closeOnce.Do(func() {
-		close(s.stopCh)
-	})
-
+	close(s.stopCh)
 	s.wg.Wait()
 	return s.finalError()
 }
@@ -170,8 +161,6 @@ func (s *QueueStore) SchedulePersist(state State) {
 			select {
 			case <-s.stopCh:
 				return
-				// Избавляемся от устаревшего состояния в канале, чтобы освободить место
-				// и сразу записать более свежую версию.
 			case <-s.updates:
 			default:
 			}
@@ -182,11 +171,10 @@ func (s *QueueStore) SchedulePersist(state State) {
 // loop — главный цикл: накапливает pending, перезапускает таймер дебаунса,
 // пишет снапшот по таймеру, по Flush или на остановке. Все записи идут через writeState().
 func (s *QueueStore) loop() {
-	var (
-		pending *State
-		timer   *time.Timer
-		timerC  <-chan time.Time
-	)
+	var pending *State
+
+	timer := time.NewTimer(s.debounce)
+	timer.Stop()
 
 	defer logger.Debug("QueueStore: loop exited")
 
@@ -195,61 +183,41 @@ func (s *QueueStore) loop() {
 		case state := <-s.updates:
 			// state уже пришёл как Clone() из SchedulePersist
 			pending = &state
-			if timer == nil {
-				timer = time.NewTimer(s.debounce)
-				timerC = timer.C
-			} else {
-				stopAndDrainTimer(timer)
-				timer.Reset(s.debounce)
-			}
+			stopAndDrainTimer(timer)
+			timer.Reset(s.debounce)
 
-		case <-timerC:
-			_ = s.consumePending(&pending)
-			timerC = nil
-			timer = nil
-
-		case req := <-s.flushCh:
-			if timer != nil {
-				stopAndDrainTimer(timer)
-				timer = nil
-				timerC = nil
-			}
-			err := s.consumePending(&pending)
-			req.reply <- err
+		case <-timer.C:
+			s.consumePending(&pending)
 
 		case <-s.stopCh:
 			stopAndDrainTimer(timer)
-			_ = s.consumePending(&pending)
+			s.consumePending(&pending)
 			return
 		}
 	}
 }
 
 // stopAndDrainTimer останавливает таймер и осушает его канал, если нужно.
-func stopAndDrainTimer(t *time.Timer) {
-	if t == nil {
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil {
 		return
 	}
-	if !t.Stop() {
+	if !timer.Stop() {
 		select {
-		case <-t.C:
+		case <-timer.C:
 		default:
 		}
 	}
 }
 
-// consumePending пишет накопленный снапшот (если есть) и сбрасывает указатель.
-// Сохраняет первую ошибку для возврата из Close().
-func (s *QueueStore) consumePending(pending **State) error {
-	var err error
+// consumePending записывает pending состояние, если оно есть, и обнуляет его.
+func (s *QueueStore) consumePending(pending **State) {
 	if *pending != nil {
-		err = s.writeState(**pending)
-		if err != nil {
+		if err := s.writeState(**pending); err != nil {
 			s.setFinalErr(err)
 		}
 		*pending = nil
 	}
-	return err
 }
 
 // FailedStore — отдельный журнал окончательно провалившихся заданий.
