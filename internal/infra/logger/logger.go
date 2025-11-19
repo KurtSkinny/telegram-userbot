@@ -13,6 +13,9 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
+
+	"telegram-userbot/internal/infra/config"
 )
 
 var (
@@ -28,6 +31,10 @@ var (
 	stdoutWriter = zapcore.Lock(zapcore.AddSync(os.Stdout))
 	// stderrWriter определяет поток для вывода ошибок логгера.
 	stderrWriter = zapcore.Lock(zapcore.AddSync(os.Stderr))
+	// fileWriter определяет поток для файлового логирования (может быть nil).
+	fileWriter io.Writer
+	// fileLevel управляет уровнем логирования в файл независимо от консольного уровня.
+	fileLevel = zap.NewAtomicLevelAt(zap.DebugLevel)
 )
 
 // defaultEncoderConfig формирует консольный encoder с цветами и коротким caller.
@@ -48,12 +55,41 @@ func defaultEncoderConfig() zapcore.EncoderConfig {
 	}
 }
 
+// jsonEncoderConfig формирует JSON encoder для файлового логирования.
+// Использует ISO8601 время и строковые представления без цветов.
+func jsonEncoderConfig() zapcore.EncoderConfig {
+	return zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
+	}
+}
+
 // rebuildLoggerLocked пересоздаёт глобальный логгер с текущими настройками потоков и уровнем.
 // Предполагается, что вызывающий уже удерживает mu. AddCallerSkip(1) скрывает обёртки logger.*
 // в стеке вызовов. Перед заменой предыдущий логгер аккуратно Sync(), чтобы сбросить буферы.
 func rebuildLoggerLocked() {
-	encoder := zapcore.NewConsoleEncoder(encoderCfg)
-	core := zapcore.NewCore(encoder, stdoutWriter, logLevel)
+	// Консольный core
+	consoleEncoder := zapcore.NewConsoleEncoder(encoderCfg)
+	consoleCore := zapcore.NewCore(consoleEncoder, stdoutWriter, logLevel)
+
+	var core = consoleCore
+
+	// Если включено файловое логирование, создаём объединённый core
+	if fileWriter != nil {
+		fileEncoder := zapcore.NewJSONEncoder(jsonEncoderConfig())
+		fileCore := zapcore.NewCore(fileEncoder, zapcore.AddSync(fileWriter), fileLevel)
+		core = zapcore.NewTee(consoleCore, fileCore)
+	}
+
 	if log != nil {
 		_ = log.Sync()
 	}
@@ -63,11 +99,15 @@ func rebuildLoggerLocked() {
 // Init инициализирует глобальный zap-логгер и настраивает уровень.
 // Допустимые уровни: debug, info (по умолчанию), warn, error. Значение сравнивается без учёта регистра.
 // Encoder берётся из defaultEncoderConfig. Потокобезопасно.
-func Init(level string) {
+func Init() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	switch strings.ToLower(level) {
+	// Читаем конфигурацию файлового логирования
+	env := config.Env()
+
+	// Устанавливаем уровень консольного логирования
+	switch strings.ToLower(env.LogLevel) {
 	case "debug":
 		logLevel.SetLevel(zap.DebugLevel)
 	case "warn":
@@ -76,6 +116,33 @@ func Init(level string) {
 		logLevel.SetLevel(zap.ErrorLevel)
 	default:
 		logLevel.SetLevel(zap.InfoLevel)
+	}
+
+	// Инициализируем файловое логирование, если указан путь к файлу
+	if env.LogFile != "" {
+		lumberjackLogger := &lumberjack.Logger{
+			Filename:   env.LogFile,
+			MaxSize:    env.LogFileMaxSize, // MB
+			MaxBackups: env.LogFileMaxBackups,
+			MaxAge:     env.LogFileMaxAge, // дни
+			Compress:   env.LogFileCompress,
+		}
+		fileWriter = lumberjackLogger
+
+		// Устанавливаем независимый уровень логирования для файла
+		switch strings.ToLower(env.LogFileLevel) {
+		case "debug":
+			fileLevel.SetLevel(zap.DebugLevel)
+		case "warn":
+			fileLevel.SetLevel(zap.WarnLevel)
+		case "error":
+			fileLevel.SetLevel(zap.ErrorLevel)
+		default:
+			fileLevel.SetLevel(zap.InfoLevel)
+		}
+	} else {
+		// Отключаем файловое логирование
+		fileWriter = nil
 	}
 
 	encoderCfg = defaultEncoderConfig()

@@ -39,6 +39,9 @@ type QueueStore struct {
 	wg       sync.WaitGroup
 	finalErr error
 	errMu    sync.Mutex
+
+	stopOnce  sync.Once
+	startOnce sync.Once
 }
 
 // NewQueueStore подготавливает файловое хранилище: нормализует путь,
@@ -128,15 +131,19 @@ func ensureStateFile(path string) (State, error) {
 
 // Start запускает фоновую горутину persist-воркера. Повторные вызовы безопасно игнорируются.
 func (s *QueueStore) Start() {
-	s.wg.Go(func() {
-		s.loop()
+	s.startOnce.Do(func() {
+		s.wg.Go(func() {
+			s.loop()
+		})
 	})
 }
 
 // Stop корректно завершает фоновую запись и дожидается её окончания.
 // Все отложенные записи будут выполнены. Возвращает первую ошибку записи, если была.
 func (s *QueueStore) Stop() error {
-	close(s.stopCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 	s.wg.Wait()
 	return s.finalError()
 }

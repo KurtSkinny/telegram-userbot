@@ -57,6 +57,13 @@ type EnvConfig struct {
 	FiltersFile       string
 	PeersCacheFile    string
 	RecipientsFile    string // НОВОЕ
+	// Файловое логирование
+	LogFile           string
+	LogFileLevel      string
+	LogFileMaxSize    int
+	LogFileMaxBackups int
+	LogFileMaxAge     int
+	LogFileCompress   bool
 }
 
 // Config хранит конфигурацию среды.
@@ -75,7 +82,7 @@ const (
 	defaultDedupWindowSec    = 120
 	defaultDebounceEditMS    = 2000
 	defaultAdminUID          = 0
-	defaultLogLevel          = "debug"
+	defaultLogLevel          = "info"
 	defaultSessionFile       = "data/session.bin"
 	defaultStateFile         = "data/state.json"
 	defaultNotifier          = "client"
@@ -88,6 +95,12 @@ const (
 	defaultFiltersFile       = "assets/filters.json"
 	defaultRecipientsFile    = "assets/recipients.json"
 	defaultPeersCacheFile    = "data/peers_cache.bbolt"
+	// Файловое логирование (LOG_FILE не имеет дефолта - должен быть явно указан для активации)
+	defaultLogFileLevel      = "debug"
+	defaultLogFileMaxSize    = 50
+	defaultLogFileMaxBackups = 3
+	defaultLogFileMaxAge     = 7
+	defaultLogFileCompress   = true
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
@@ -148,7 +161,7 @@ func loadConfig(envPath string) (*Config, error) {
 	dedupWindow := parseIntDefault("DEDUP_WINDOW_SEC", defaultDedupWindowSec, nonNegative, &warnings)
 	debounceMS := parseIntDefault("DEBOUNCE_EDIT_MS", defaultDebounceEditMS, nonNegative, &warnings)
 	adminUID := parseIntDefault("ADMIN_UID", defaultAdminUID, nonNegative, &warnings)
-	logLevel := sanitizeLogLevel(os.Getenv("LOG_LEVEL"), &warnings)
+	logLevel := sanitizeLogLevel(os.Getenv("LOG_LEVEL"), defaultLogLevel, &warnings)
 	botToken := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 	notifier := sanitizeNotifier(botToken, os.Getenv("NOTIFIER"), &warnings)
 	sessionFile := sanitizeFile("SESSION_FILE", os.Getenv("SESSION_FILE"), defaultSessionFile, &warnings)
@@ -168,6 +181,12 @@ func loadConfig(envPath string) (*Config, error) {
 	peersCacheFile := sanitizeFile("PEERS_CACHE_FILE", os.Getenv("PEERS_CACHE_FILE"), defaultPeersCacheFile, &warnings)
 	recipientsFile := sanitizeFile("RECIPIENTS_FILE", os.Getenv("RECIPIENTS_FILE"),
 		defaultRecipientsFile, &warnings)
+	logFile := strings.TrimSpace(os.Getenv("LOG_FILE"))
+	logFileLevel := sanitizeLogLevel(os.Getenv("LOG_FILE_LEVEL"), defaultLogFileLevel, &warnings)
+	logFileMaxSize := parseIntDefault("LOG_FILE_MAX_SIZE_MB", defaultLogFileMaxSize, greaterThanZero, &warnings)
+	logFileMaxBackups := parseIntDefault("LOG_FILE_MAX_BACKUPS", defaultLogFileMaxBackups, nonNegative, &warnings)
+	logFileMaxAge := parseIntDefault("LOG_FILE_MAX_AGE_DAYS", defaultLogFileMaxAge, nonNegative, &warnings)
+	logFileCompress := parseBoolDefault("LOG_FILE_COMPRESS", defaultLogFileCompress, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,
@@ -193,6 +212,12 @@ func loadConfig(envPath string) (*Config, error) {
 		FiltersFile:       filtersFile,
 		RecipientsFile:    recipientsFile,
 		PeersCacheFile:    peersCacheFile,
+		LogFile:           logFile,
+		LogFileLevel:      logFileLevel,
+		LogFileMaxSize:    logFileMaxSize,
+		LogFileMaxBackups: logFileMaxBackups,
+		LogFileMaxAge:     logFileMaxAge,
+		LogFileCompress:   logFileCompress,
 	}
 
 	cfg := &Config{
@@ -269,20 +294,35 @@ func appendWarningf(warnings *[]string, format string, args ...any) {
 func greaterThanZero(v int) bool { return v > 0 }
 func nonNegative(v int) bool     { return v >= 0 }
 
+// parseBoolDefault читает name как bool. Если пусто/некорректно — возвращает defaultVal и пишет предупреждение.
+func parseBoolDefault(name string, defaultVal bool, warnings *[]string) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		appendWarningf(warnings, "env %s is not set; using default %v", name, defaultVal)
+		return defaultVal
+	}
+	v, err := strconv.ParseBool(value)
+	if err != nil {
+		appendWarningf(warnings, "env %s value %q is not a valid boolean; using default %v", name, value, defaultVal)
+		return defaultVal
+	}
+	return v
+}
+
 // sanitizeLogLevel нормализует LOG_LEVEL и ограничивает значения набором
 // {debug, info, warn, error}. Всё остальное превращается в defaultLogLevel.
-func sanitizeLogLevel(level string, warnings *[]string) string {
+func sanitizeLogLevel(level string, defaultVal string, warnings *[]string) string {
 	lvl := strings.ToLower(strings.TrimSpace(level))
 	if lvl == "" {
-		appendWarningf(warnings, "env LOG_LEVEL is not set; using default %q", defaultLogLevel)
-		return defaultLogLevel
+		appendWarningf(warnings, "env LOG_LEVEL is not set; using default %q", defaultVal)
+		return defaultVal
 	}
 	switch lvl {
 	case "debug", "info", "warn", "error":
 		return lvl
 	default:
-		appendWarningf(warnings, "env LOG_LEVEL value %q is invalid; using default %q", level, defaultLogLevel)
-		return defaultLogLevel
+		appendWarningf(warnings, "env LOG_LEVEL value %q is invalid; using default %q", level, defaultVal)
+		return defaultVal
 	}
 }
 

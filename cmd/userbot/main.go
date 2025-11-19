@@ -38,7 +38,7 @@ func main() {
 	}
 
 	// logger.Init задаёт уровень, а SetWriters перенаправляет выводы в подсистему pr (чтобы видеть логи в CLI UI).
-	logger.Init(config.Env().LogLevel)
+	logger.Init()
 	logger.SetWriters(pr.Stdout(), pr.Stderr())
 	for _, msg := range config.Warnings() {
 		logger.Warn(msg)
