@@ -67,17 +67,17 @@ func (h *lazyUpdateHandler) set(realHandler telegram.UpdateHandler) {
 //   - маршрутизацию апдейтов и регистрацию доменных обработчиков,
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
-	filters   *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
-	notif     *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
-	dupCache  *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).
-	debouncer *concurrency.Debouncer    // Сглаживание бурстов (частые правки одного сообщения и т.п.).
-	handlers  *domainupdates.Handlers   // Доменные обработчики апдейтов и фоновые задачи.
-	runner    *Runner                   // Оркестратор жизненного цикла и CLI.
-	updMgr    *tgupdates.Manager        // Менеджер апдейтов gotd: поток событий и локальное состояние.
-	peers     *peersmgr.Service         // Менеджер пиров + persist storage.
-	waiter    *floodwait.Waiter         // Middleware для обработки FLOOD_WAIT.
-	ctx       context.Context           // Внешний контекст приложения (отменяется по сигналам/CLI).
-	stop      context.CancelFunc        // Инициирует общий shutdown.
+	mainCtx    context.Context           // Контекст жизненного цикла приложения.
+	mainCancel context.CancelFunc        // Инициирует отмену mainCtx.
+	filters    *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
+	notif      *notifications.Queue      // Асинхронная очередь уведомлений: транспорт client/bot, график, ретраи.
+	dupCache   *concurrency.Deduplicator // Фильтр повторов за заданное окно (идемпотентность на уровне событий).
+	debouncer  *concurrency.Debouncer    // Сглаживание бурстов (частые правки одного сообщения и т.п.).
+	handlers   *domainupdates.Handlers   // Доменные обработчики апдейтов и фоновые задачи.
+	runner     *Runner                   // Оркестратор жизненного цикла и CLI.
+	updMgr     *tgupdates.Manager        // Менеджер апдейтов gotd: поток событий и локальное состояние.
+	peers      *peersmgr.Service         // Менеджер пиров + persist storage.
+	waiter     *floodwait.Waiter         // Middleware для обработки FLOOD_WAIT.
 }
 
 // CleanPeriodHours — периодичность очистки внутренних фильтров/кэшей уведомлений (часы),
@@ -89,16 +89,20 @@ const (
 )
 
 // NewApp создаёт пустой каркас приложения. Фактическая инициализация выполняется в Init().
-func NewApp() *App {
-	return &App{}
+func NewApp(mainCtx context.Context, mainCancel context.CancelFunc) *App {
+	return &App{
+		mainCtx:    mainCtx,
+		mainCancel: mainCancel,
+	}
 }
 
-// Init связывает компоненты приложения и подготавливает их к запуску
-func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
+// Run запускает основной цикл приложения: инициализацию клиента, менеджера апдейтов,
+// доменных обработчиков и прочих сервисов, а затем стартует Runner,
+// который оркестрирует жизненный цикл и корректное завершение работы.
+// Блокируется до остановки приложения и возвращает ошибку, если что-то пошло не так.
+func (a *App) Run() error {
 	logger.Info("Userbot initializing...")
 
-	a.ctx = ctx
-	a.stop = stop
 	dispatcher := tg.NewUpdateDispatcher()
 	lazyHandler := &lazyUpdateHandler{}
 	a.waiter = floodwait.NewWaiter()
@@ -138,7 +142,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	if peersMgrErr != nil {
 		return fmt.Errorf("init peers manager: %w", peersMgrErr)
 	}
-	if err := peersSvc.LoadFromStorage(ctx); err != nil {
+	if err := peersSvc.LoadFromStorage(a.mainCtx); err != nil {
 		return fmt.Errorf("load peers storage: %w", err)
 	}
 	a.peers = peersSvc
@@ -219,7 +223,7 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
 
 	// Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
-	h := domainupdates.NewHandlers(client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.stop, a.peers)
+	h := domainupdates.NewHandlers(client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.mainCancel, a.peers)
 	a.handlers = h
 
 	// Маршрутизация апдейтов на доменные обработчики.
@@ -229,14 +233,17 @@ func (a *App) Init(ctx context.Context, stop context.CancelFunc) error {
 	dispatcher.OnEditChannelMessage(h.OnEditChannelMessage)
 
 	// Конструируем Runner, который запустит цикл и обеспечит корректный shutdown.
-	a.runner = NewRunner(a.ctx, a.stop, client, a.filters, a.notif, a.dupCache, a.debouncer, a.handlers, a.peers)
+	a.runner = NewRunner(
+		a.mainCtx,
+		a.mainCancel,
+		client,
+		a.filters,
+		a.notif,
+		a.dupCache,
+		a.debouncer,
+		a.handlers,
+		a.peers,
+	)
 
-	return nil
-}
-
-// Run делегирует запуск основного цикла Runner’у с уже сконфигурированным менеджером апдейтов.
-func (a *App) Run() error {
-	return a.waiter.Run(a.ctx, func(ctx context.Context) error {
-		return a.runner.Run(a.updMgr)
-	})
+	return a.runner.Run(a.waiter, a.updMgr)
 }

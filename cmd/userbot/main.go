@@ -44,22 +44,16 @@ func main() {
 		logger.Warn(msg)
 	}
 
-	// Контекст с обработкой системных сигналов (Ctrl+C/SIGTERM). Важно: stop() нужно вызвать, чтобы снять подписку.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Создаём контекст приложения, который будет отменён при получении сигнала завершения.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	// Собираем приложение и передаём ему контекст жизненного цикла и stop как внешнюю CancelFunc.
-	a := app.NewApp()
-	if iniErr := a.Init(ctx, stop); iniErr != nil {
-		stop()
-		logger.Fatal("app init failed", zap.Error(iniErr))
+	// Создаём и запускаем приложение.
+	a := app.NewApp(ctx, cancel)
+	if err := a.Run(); err != nil {
+		cancel()
+		logger.Fatal("app init failed", zap.Error(err))
 	}
 
-	// Запускаем основной цикл; блокируется до shutdown. Ошибки — фатальны, инициируем остановку и выходим.
-	if runErr := a.Run(); runErr != nil {
-		stop()
-		logger.Fatal("app run failed", zap.Error(runErr))
-	}
-	// Освобождаем обработчик сигналов и закрываем ресурсы bootstrap-уровня.
-	stop()
-	logger.Info("Graceful shutdown complete")
+	logger.Info("Shutdown complete")
 }

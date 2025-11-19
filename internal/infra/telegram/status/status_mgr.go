@@ -13,7 +13,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/connection"
 	"time"
 
-	"github.com/gotd/td/tg"
+	"github.com/gotd/td/telegram"
 )
 
 const offlineGraceTimeout = 10 * time.Second
@@ -23,7 +23,7 @@ const offlineGraceTimeout = 10 * time.Second
 // а при отсутствии активности уводит в offline по таймауту.
 // Также предоставляет методы для эмуляции статуса "печатает".
 type statusManager struct {
-	api    *tg.Client
+	client *telegram.Client
 	pingCh chan int      // Буферизованный канал сигналов активности (пинги)
 	doneCh chan struct{} // Канал для сигнализации о завершении работы менеджера
 }
@@ -37,9 +37,10 @@ var (
 	statusCancel context.CancelFunc
 )
 
-// Start создаёт и запускает менеджер статуса. Безопасна к повторным вызовам: второй и далее — no-op.
-// Контекст управляет жизненным циклом фоновой горутины. Через api выполняются вызовы AccountUpdateStatus.
-func Start(ctx context.Context, api *tg.Client) {
+// Start инициализирует и запускает глобальный менеджер статуса с переданным tg.Client.
+// Если менеджер уже запущен, вызов игнорируется.
+// clientCtx используется как родительский контекст для жизненного цикла менеджера.
+func Start(ctx context.Context, client *telegram.Client) {
 	if manager != nil {
 		return
 	}
@@ -50,14 +51,14 @@ func Start(ctx context.Context, api *tg.Client) {
 	runCtx, cancel := context.WithCancel(ctx)
 	// Отдельный под-контекст, чтобы можно было целенаправленно гасить менеджер из Shutdown().
 	manager = &statusManager{
-		api:    api,
+		client: client,
 		pingCh: make(chan int, 1),
 		doneCh: make(chan struct{}),
 	}
 	// pingCh имеет размер 1, поэтому частые пинги будут схлопываться до одного непроцессенного сигнала.
 	statusCancel = cancel
 	statusWg.Go(func() {
-		manager.run(runCtx)
+		manager.run(runCtx, ctx)
 	})
 }
 
@@ -77,7 +78,6 @@ func Stop() {
 	if cancel != nil {
 		cancel()
 	}
-
 	statusWg.Wait()
 }
 
@@ -169,8 +169,9 @@ func (m *statusManager) setOnline(ctx context.Context, online *bool, lastOnlineA
 		return
 	}
 	connection.WaitOnline(ctx)
-	if _, err := m.api.AccountUpdateStatus(ctx, false); err != nil {
+	if _, err := m.client.API().AccountUpdateStatus(ctx, false); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.Debugf("StatusManager: context cancelled while going online (%v)", err)
 			return
 		}
 		connection.HandleError(err)
@@ -193,14 +194,9 @@ func (m *statusManager) setOffline(ctx context.Context, reason string, online *b
 	}
 
 	connection.WaitOnline(ctx)
-	callCtx := ctx
-	if ctx.Err() != nil && (errors.Is(ctx.Err(), context.Canceled) || reason == "context cancel") {
-		var cancel context.CancelFunc
-		callCtx, cancel = context.WithTimeout(context.Background(), offlineGraceTimeout)
-		defer cancel()
-	}
-	if _, err := m.api.AccountUpdateStatus(callCtx, true); err != nil {
+	if _, err := m.client.API().AccountUpdateStatus(ctx, true); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.Debugf("StatusManager: context cancelled while going offline (%v)", err)
 			return
 		}
 		connection.HandleError(err)
@@ -214,7 +210,7 @@ func (m *statusManager) setOffline(ctx context.Context, reason string, online *b
 // run управляет жизненным циклом статуса: реагирует на pingCh, включает online и по таймеру уходит в offline.
 // На завершение контекста пытается аккуратно отправить offline и закрывает doneCh. Перед Reset таймера всегда
 // выполняется drain его канала, чтобы избежать спурионных тиков.
-func (m *statusManager) run(ctx context.Context) {
+func (m *statusManager) run(runCtx context.Context, clientCtx context.Context) {
 	online := false
 	lastOnlineAt := time.Now()
 	timer := time.NewTimer(time.Hour)
@@ -223,8 +219,8 @@ func (m *statusManager) run(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			m.setOffline(ctx, "context cancel", &online)
+		case <-runCtx.Done():
+			m.setOffline(clientCtx, "exiting", &online)
 			close(m.doneCh)
 			return
 		case waitMs := <-m.pingCh:
@@ -235,7 +231,7 @@ func (m *statusManager) run(ctx context.Context) {
 				}
 			}
 			// получен "пинг" — активность обнаружена, продлеваем онлайн-сессию
-			m.setOnline(ctx, &online, &lastOnlineAt)
+			m.setOnline(clientCtx, &online, &lastOnlineAt)
 			// Перед Reset нужно остановить и осушить канал таймера, иначе можно поймать старый тик.
 			randomTimeout := time.Duration(waitMs) * time.Millisecond
 			logger.Debugf("StatusManager: activity detected, next offline in %v", randomTimeout)
@@ -243,7 +239,7 @@ func (m *statusManager) run(ctx context.Context) {
 
 		case <-timer.C:
 			// истёк таймаут без активности — переходим в офлайн и ждём новых событий
-			m.setOffline(ctx, "idle timeout", &online)
+			m.setOffline(clientCtx, "idle timeout", &online)
 		}
 	}
 }

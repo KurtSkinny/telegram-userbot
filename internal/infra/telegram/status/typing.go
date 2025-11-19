@@ -26,7 +26,7 @@ func DoTypingWaitMs(ctx context.Context, peer tg.InputPeerClass, minMs, maxMs in
 	deltaMs := shared.Random(deltaMinMs, deltaMaxMs)
 	goOnlineInterval(deltaMs+minMs, deltaMs+maxMs)
 	// Включаем typing через API; ошибки намеренно глотаем — это косметика.
-	_, _ = manager.api.MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
+	_, _ = manager.client.API().MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
 		Peer:   peer,
 		Action: &tg.SendMessageTypingAction{},
 	})

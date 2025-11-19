@@ -25,6 +25,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/status"
 
 	"github.com/go-faster/errors"
+	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	tgupdates "github.com/gotd/td/telegram/updates"
@@ -44,9 +45,9 @@ type Runner struct {
 	notif         *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
 	dedup         *concurrency.Deduplicator // Защита от повторной обработки событий (идемпотентность на уровне сигналов).
 	deb           *concurrency.Debouncer    // Сглаживание/слияние частых событий (например, всплесков апдейтов).
-	h             *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
-	ctx           context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
-	stop          context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
+	handlers      *domainupdates.Handlers   // Композиция доменных обработчиков апдейтов Telegram.
+	mainCtx       context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
+	mainCancel    context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
 	peers         *peersmgr.Service         // Сервис пиров (peers.Manager + persist storage).
 	cliService    *cli.Service              // CLI сервис для интерактивных команд.
 	updatesWG     sync.WaitGroup            // WaitGroup для updates_manager.
@@ -56,8 +57,8 @@ type Runner struct {
 // NewRunner подготавливает Runner с переданными зависимостями: ядро клиента, очередь уведомлений,
 // утилиты конкуррентности и доменные обработчики. Возвращает объект, готовый к запуску Run().
 func NewRunner(
-	ctx context.Context,
-	stop context.CancelFunc,
+	mainCtx context.Context,
+	mainCancel context.CancelFunc,
 	client *telegram.Client,
 	filters *filters.FilterEngine,
 	notif *notifications.Queue,
@@ -67,15 +68,15 @@ func NewRunner(
 	peers *peersmgr.Service,
 ) *Runner {
 	return &Runner{
-		ctx:     ctx,
-		stop:    stop,
-		client:  client,
-		filters: filters,
-		notif:   notif,
-		dedup:   dedup,
-		deb:     debouncer,
-		h:       handlers,
-		peers:   peers,
+		mainCtx:    mainCtx,
+		mainCancel: mainCancel,
+		client:     client,
+		filters:    filters,
+		notif:      notif,
+		dedup:      dedup,
+		deb:        debouncer,
+		handlers:   handlers,
+		peers:      peers,
 	}
 }
 
@@ -83,46 +84,42 @@ func NewRunner(
 // и управляет корректным завершением. Блокируется до завершения клиентского контекста.
 // Важно: используется отдельный контекст для MTProto‑движка, чтобы дать шанс статусам/очередям
 // корректно завершиться до гашения сетевого уровня.
-func (r *Runner) Run(updmgr *tgupdates.Manager) error {
+func (r *Runner) Run(waiter *floodwait.Waiter, updmgr *tgupdates.Manager) error {
 	clientCtx, clientCancel := context.WithCancel(context.Background())
 	defer clientCancel()
 
 	// Запускаем отслеживание сигналов сразу, чтобы Ctrl+C работал во время инициализации
 	var shutdownWG sync.WaitGroup
-	shutdownTriggered := make(chan struct{})
 
 	shutdownWG.Go(func() {
-		<-r.ctx.Done()
-		logger.Debug("Shutdown signal received during startup/runtime")
-		// Останавливаем сервисы (если они уже запущены)
+		<-r.mainCtx.Done()
+		logger.Debug("Shutdown signal received, stopping runner...")
 		r.stopAllServices()
-		clientCancel() // Отменяем client.Run(), что приведет к завершению
-		close(shutdownTriggered)
+		clientCancel()
 	})
 
-	defer func() {
-		// Ждем завершения горутины отслеживания сигналов
-		shutdownWG.Wait()
-	}()
+	return waiter.Run(clientCtx, func(ctx context.Context) error {
+		return r.client.Run(ctx, func(ctx context.Context) error {
+			logger.Info("Userbot running...")
 
-	return r.client.Run(clientCtx, func(ctx context.Context) error {
-		logger.Info("Userbot running...")
+			self, loginErr := r.loginSelf(ctx)
+			if loginErr != nil {
+				return loginErr
+			}
 
-		self, loginErr := r.loginSelf(ctx)
-		if loginErr != nil {
-			return loginErr
-		}
+			if err := r.initPeersIfNeeded(ctx); err != nil {
+				return err
+			}
 
-		if err := r.initPeersIfNeeded(ctx); err != nil {
-			return err
-		}
+			if err := r.startAllServices(ctx, updmgr, self.ID); err != nil {
+				r.stopAllServices()
+				return err
+			}
 
-		if err := r.startAllServices(ctx, updmgr, self.ID); err != nil {
-			r.stopAllServices()
-			return err
-		}
-
-		return r.runMainLoop(ctx, shutdownTriggered)
+			<-ctx.Done()
+			shutdownWG.Wait()
+			return ctx.Err()
+		})
 	})
 }
 
@@ -181,7 +178,7 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager, selfID int64) error {
 	// cli
 	logger.Debug("starting service cli")
-	r.cliService = cli.NewService(r.client, r.stop, r.filters, r.notif, r.peers)
+	r.cliService = cli.NewService(r.client, r.mainCancel, r.filters, r.notif, r.peers)
 	r.cliService.Start(ctx)
 	logger.Debug("service cli started")
 
@@ -195,7 +192,7 @@ func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager
 
 	// status_manager
 	logger.Debug("starting service status_manager")
-	status.Start(ctx, r.client.API())
+	status.Start(ctx, r.client)
 	logger.Debug("service status_manager started")
 
 	// deduplicator
@@ -215,9 +212,7 @@ func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager
 
 	// domain_handlers
 	logger.Debug("starting service domain_handlers")
-	if r.h != nil {
-		r.h.Start(ctx, CleanPeriodHours*time.Hour)
-	}
+	r.handlers.Start(ctx, CleanPeriodHours*time.Hour)
 	logger.Debug("service domain_handlers started")
 
 	// updates_manager
@@ -233,10 +228,11 @@ func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager
 		})
 		if mgrErr != nil && !errors.Is(mgrErr, context.Canceled) {
 			logger.Errorf("updmgr.Run return: %v", mgrErr)
+			r.mainCancel()
 		}
 		logger.Debugf("updates_manager service: Run finished (err=%v)", mgrErr)
 		// По завершении обновлений инициируем общий shutdown.
-		r.stop()
+		// r.stop()
 	})
 	logger.Debug("service updates_manager started")
 
@@ -245,10 +241,6 @@ func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager
 
 func (r *Runner) stopAllServices() {
 	// Останавливаем в обратном порядке
-	// status_manager
-	logger.Debug("stopping service status_manager")
-	status.Stop()
-	logger.Debug("service status_manager stopped")
 
 	// updates_manager
 	logger.Debug("stopping service updates_manager")
@@ -258,11 +250,14 @@ func (r *Runner) stopAllServices() {
 	r.updatesWG.Wait() // Ждем завершения горутины
 	logger.Debug("service updates_manager stopped")
 
+	// status_manager
+	logger.Debug("stopping service status_manager")
+	status.Stop()
+	logger.Debug("service status_manager stopped")
+
 	// domain_handlers
 	logger.Debug("stopping service domain_handlers")
-	if r.h != nil {
-		r.h.Stop()
-	}
+	r.handlers.Stop()
 	logger.Debug("service domain_handlers stopped")
 
 	// notifications_queue
@@ -302,27 +297,6 @@ func (r *Runner) stopAllServices() {
 		r.cliService.Stop()
 		logger.Debug("service cli stopped")
 	}
-}
-
-func (r *Runner) runMainLoop(
-	ctx context.Context,
-	shutdownTriggered <-chan struct{},
-) error {
-	// Ждем завершения контекста (либо от внешнего сигнала, либо от внутренней ошибки)
-	<-ctx.Done()
-
-	// Проверяем, был ли shutdown инициирован извне (через сигнал)
-	select {
-	case <-shutdownTriggered:
-		// Shutdown уже обработан в горутине отслеживания сигналов
-		logger.Debug("Graceful shutdown already initiated by signal handler")
-	default:
-		// Shutdown инициирован изнутри (например, из updates_manager), останавливаем сервисы
-		logger.Debug("Shutdown initiated internally, stopping services")
-		r.stopAllServices()
-	}
-
-	return ctx.Err()
 }
 
 // handleUpdatesManagerStart вызывается updates.Manager при старте обработки апдейтов.
