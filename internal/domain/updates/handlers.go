@@ -30,16 +30,11 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-// Handlers агрегирует зависимости и реализует реакции на ключевые типы
-// апдейтов Telegram. Экземпляр поддерживает:
-//   - обращение к Telegram API для служебных операций;
-//   - постановку уведомлений в очередь с соблюдением идемпотентности;
-//   - локальный кэш комбинаций «сообщение × фильтр», уже отработанных;
-//   - дедупликацию по (peerID, msgID, editDate), чтобы не переобрабатывать
-//     одно и то же содержимое;
-//   - дебаунс частых правок одного сообщения, чтобы не заспамить очередь;
-//   - грубые счетчики непрочитанного по пирам для вспомогательных эвристик;
-//   - фоновую очистку устаревших отметок notified и периодический сброс их на диск.
+// WebAuthTokenGenerator интерфейс для генерации токенов авторизации
+type WebAuthTokenGenerator interface {
+	GenerateAuthToken() string
+}
+
 type Handlers struct {
 	api       *tg.Client                // api предоставляет доступ к TDLib-клиенту для служебных запросов
 	filters   *filters.FilterEngine     // filters содержит движок фильтров для матчинга сообщений
@@ -51,6 +46,10 @@ type Handlers struct {
 	unread    map[int64]int             // unread хранит счётчики непрочитанных сообщений по пирами
 	unreadMu  sync.Mutex                // unreadMu синхронизирует конкурентные обновления карты unread
 	peers     *peersmgr.Service         // peers предоставляет доступ к менеджеру пиров и локальному снапшоту
+
+	webAuth      WebAuthTokenGenerator // webAuth генерирует токены для веб-интерфейса
+	lastAuthTime time.Time             // lastAuthTime хранит время последней авторизации через веб
+	authMu       sync.Mutex            // authMu защищает доступ к lastAuthTime в конкурентной среде
 
 	notifiedCacheFile string
 	notifiedDirty     bool
@@ -88,7 +87,13 @@ func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notificat
 		shutdown:          shutdown,
 		notifiedCacheFile: cfg.NotifiedCacheFile,
 		peers:             peers,
+		webAuth:           nil, // будет установлен через SetWebAuth
 	}
+}
+
+// SetWebAuth устанавливает генератор токенов для веб-интерфейса
+func (h *Handlers) SetWebAuth(webAuth WebAuthTokenGenerator) {
+	h.webAuth = webAuth
 }
 
 // Start запускает фоновые воркеры и восстанавливает состояние notified-кэша.
@@ -170,6 +175,15 @@ func (h *Handlers) OnNewMessage(
 			h.shutdown()
 		}
 		return nil
+	}
+
+	// Команда auth - генерирует токен для веб-интерфейса
+	if msg.Message == "auth" {
+		adminUID := int64(config.Env().AdminUID)
+		if adminUID > 0 && peerID == adminUID {
+			h.handleAuthCommand(ctx, entities, msg)
+			return nil
+		}
 	}
 
 	logger.Debug("OnNewMessage")

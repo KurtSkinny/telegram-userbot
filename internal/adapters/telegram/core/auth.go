@@ -65,7 +65,6 @@ func (t TerminalAuthenticator) Password(_ context.Context) (string, error) {
 func (t TerminalAuthenticator) AcceptTermsOfService(_ context.Context, tos tg.HelpTermsOfService) error {
 	// Текст ToS может быть длинным и содержать разметку; выводим как есть.
 	pr.Printf("Telegram Terms of Service: %s\n", tos.Text)
-	// Явный запрос согласия. TODO: поддержать локализацию и расширенные варианты ответов ("yes").
 	resp, err := readLine("Do you accept? (y/n): ")
 	if err != nil {
 		return err

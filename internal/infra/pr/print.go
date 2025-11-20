@@ -65,6 +65,9 @@ func InterruptReadline() {
 // SetPrompt задаёт строку приглашения. Предполагает, что Init() уже был вызван.
 // TODO: добавить проверку rl на nil и безопасный no-op, если прому некуда выставлять.
 func SetPrompt(prompt string) {
+	if rl == nil {
+		return
+	}
 	rl.SetPrompt(prompt)
 }
 

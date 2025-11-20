@@ -14,8 +14,8 @@ import (
 const (
 	// defaultWaitMinMs — минимальная длительность ожидания по умолчанию (мс), используется в WaitRandomTime().
 	defaultWaitMinMs = 1111
-	// cefaultWaitMaxMs — максимальная длительность ожидания по умолчанию (мс). TODO: опечатка в имени, переименовать в defaultWaitMaxMs при следующем изменении API.
-	cefaultWaitMaxMs = 3333
+	// defaultWaitMaxMs — максимальная длительность ожидания по умолчанию (мс). TODO: опечатка в имени, переименовать в defaultWaitMaxMs при следующем изменении API.
+	defaultWaitMaxMs = 3333
 )
 
 // WaitRandomTimeMs блокирует текущую горутину на случайный интервал из [minMs, maxMs).
@@ -28,7 +28,7 @@ func WaitRandomTimeMs(ctx context.Context, minMs, maxMs int) {
 	switch {
 	case minMs == 0 && maxMs == 0:
 		minMs = defaultWaitMinMs
-		maxMs = cefaultWaitMaxMs
+		maxMs = defaultWaitMaxMs
 		// дефолтное окно ожидания
 	case minMs <= 0:
 		logger.Error("WaitRandomTimeMs: wait time <= 0")

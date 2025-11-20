@@ -16,8 +16,6 @@ import (
 	"github.com/gotd/td/telegram"
 )
 
-const offlineGraceTimeout = 10 * time.Second
-
 // statusManager управляет онлайн-статусом пользователя в Telegram.
 // Реагирует на сигналы активности (пинги) и поддерживает аккаунт в online,
 // а при отсутствии активности уводит в offline по таймауту.

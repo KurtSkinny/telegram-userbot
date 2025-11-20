@@ -10,22 +10,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/domain/notifications"
-	"telegram-userbot/internal/infra/config"
+	"telegram-userbot/internal/domain/commands"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
-	"telegram-userbot/internal/infra/telegram/connection"
-	"telegram-userbot/internal/infra/telegram/peersmgr"
-	"telegram-userbot/internal/infra/telegram/status"
-	versioninfo "telegram-userbot/internal/support/version"
-
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/peers"
-	"github.com/gotd/td/tg"
 )
 
 // commandDescriptor описывает одну CLI-команду: её имя и краткое описание для help.
@@ -56,34 +45,23 @@ var (
 // и синхронно закрывается через Stop(). Потокобезопасность обеспечивается
 // дисциплиной запуска/остановки и отсутствием внешних мутаций.
 type Service struct {
-	client      *telegram.Client      // API-клиент Telegram (MTProto), нужен для команд теста/диагностики
-	stopApp     context.CancelFunc    // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
-	filters     *filters.FilterEngine // Движок фильтров: загрузка, хранение, матчи.
-	notif       *notifications.Queue  // очередь уведомлений; нужна для flush/status
-	peers       *peersmgr.Service     // peers-кэш, предоставляет офлайн-данные по диалогам
-	cancel      context.CancelFunc    // локальная отмена run-цикла CLI
-	wg          sync.WaitGroup        // ожидание завершения фоновой горутины run
-	onceStart   sync.Once             // идемпотентный запуск
-	onceStop    sync.Once             // идемпотентная остановка
-	testRunning int64                 // флаг, указывающий, выполняется ли команда test в данный момент (0 - нет, 1 - да)
+	executor  commands.Executor  // Исполнитель команд
+	stopApp   context.CancelFunc // внешняя отмена приложения (используется для команды exit и Ctrl-C на пустой строке)
+	cancel    context.CancelFunc // локальная отмена run-цикла CLI
+	wg        sync.WaitGroup     // ожидание завершения фоновой горутины run
+	onceStart sync.Once          // идемпотентный запуск
+	onceStop  sync.Once          // идемпотентная остановка
 }
 
 // NewService создаёт CLI-сервис. Параметр stopApp используется как «глобальная»
-// остановка приложения (команда exit, Ctrl-C на пустой строке). Если notif задан,
-// команда "flush" инициирует внеочередной слив регулярной очереди уведомлений.
+// остановка приложения (команда exit, Ctrl-C на пустой строке).
 func NewService(
-	client *telegram.Client,
+	executor commands.Executor,
 	stopApp context.CancelFunc,
-	filterEngine *filters.FilterEngine,
-	notif *notifications.Queue,
-	peers *peersmgr.Service,
 ) *Service {
 	return &Service{
-		client:  client,
-		stopApp: stopApp,
-		filters: filterEngine,
-		notif:   notif,
-		peers:   peers,
+		executor: executor,
+		stopApp:  stopApp,
 	}
 }
 
@@ -213,35 +191,21 @@ func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 		printCommandHelp()
 	case "list":
 		pr.Println("Fetching dialogs...")
-		s.listDialogs(ctx)
+		s.handleList(ctx)
 	case "refresh dialogs":
 		s.handleRefreshDialogs(ctx)
 	case "reload":
-		// Перезагружаем фильтры и получателей с rollback при ошибке
-		if err := s.filters.Load(); err != nil {
-			pr.ErrPrintln("reload filters error:", err)
-		}
-		pr.Println("recipients.json and filters.json reloaded")
+		s.handleReload(ctx)
 	case "whoami":
-		if res, err := whoAmI(ctx, s.client); err != nil {
-			pr.ErrPrintln("whoami error:", err)
-		} else {
-			pr.Println(res)
-		}
+		s.handleWhoami(ctx)
 	case "test":
 		s.handleTestAsync(ctx)
 	case "version":
-		pr.ErrPrintln(fmt.Sprintf("%s v%s", versioninfo.Name, versioninfo.Version))
+		s.handleVersion(ctx)
 	case "flush":
-		// Внеплановый слив регулярной очереди.
-		if s.notif != nil {
-			s.notif.FlushImmediately("cli flush")
-			pr.Println("Queue flush requested.")
-		} else {
-			pr.ErrPrintln("queue is not available")
-		}
+		s.handleFlush(ctx)
 	case "status":
-		s.handleStatus()
+		s.handleStatus(ctx)
 	case "exit":
 		if s.stopApp != nil {
 			s.stopApp()
@@ -255,32 +219,75 @@ func (s *Service) handleCommand(ctx context.Context, cmd string) bool {
 	return false
 }
 
-func (s *Service) handleRefreshDialogs(ctx context.Context) {
-	if s.peers == nil {
-		pr.ErrPrintln("peers manager is not available")
+func (s *Service) handleList(ctx context.Context) {
+	result, err := s.executor.List(ctx)
+	if err != nil {
+		pr.ErrPrintln("list error:", err)
 		return
 	}
 
-	if err := s.peers.RefreshDialogs(ctx, s.client.API()); err != nil {
+	if len(result.Dialogs) == 0 {
+		pr.Println("No dialogs cached yet.")
+		return
+	}
+
+	for _, d := range result.Dialogs {
+		s.printDialog(d)
+	}
+	pr.Printf("Total dialogs: %d\n", len(result.Dialogs))
+}
+
+func (s *Service) handleRefreshDialogs(ctx context.Context) {
+	if err := s.executor.RefreshDialogs(ctx); err != nil {
 		pr.ErrPrintln("refresh dialogs error:", err)
 		return
 	}
 	pr.Println("Dialogs cache refreshed.")
 }
 
-// handleTestAsync запускает тестовую команду в отдельной горутине, если она не выполняется в данный момент.
-func (s *Service) handleTestAsync(ctx context.Context) {
-	// Проверяем, не выполняется ли уже команда test
-	if !atomic.CompareAndSwapInt64(&s.testRunning, 0, 1) {
-		pr.Println("Test command is already running, please wait...")
+func (s *Service) handleReload(ctx context.Context) {
+	if err := s.executor.ReloadFilters(ctx); err != nil {
+		pr.ErrPrintln("reload filters error:", err)
+		return
+	}
+	pr.Println("recipients.json and filters.json reloaded")
+}
+
+func (s *Service) handleWhoami(ctx context.Context) {
+	result, err := s.executor.Whoami(ctx)
+	if err != nil {
+		pr.ErrPrintln("whoami error:", err)
 		return
 	}
 
+	if result.Username != "" {
+		pr.Println(fmt.Sprintf("You are: %s (@%s), id=%d", result.FullName, result.Username, result.ID))
+	} else {
+		pr.Println(fmt.Sprintf("You are: %s, id=%d", result.FullName, result.ID))
+	}
+}
+
+func (s *Service) handleVersion(ctx context.Context) {
+	result, err := s.executor.Version(ctx)
+	if err != nil {
+		pr.ErrPrintln("version error:", err)
+		return
+	}
+	pr.ErrPrintln(fmt.Sprintf("%s v%s", result.Name, result.Version))
+}
+
+func (s *Service) handleFlush(ctx context.Context) {
+	if err := s.executor.Flush(ctx); err != nil {
+		pr.ErrPrintln("flush error:", err)
+		return
+	}
+	pr.Println("Queue flush requested.")
+}
+
+// handleTestAsync запускает тестовую команду в отдельной горутине
+func (s *Service) handleTestAsync(ctx context.Context) {
 	// Запускаем выполнение в отдельной горутине
 	go func() {
-		// Гарантируем сброс флага при завершении
-		defer atomic.StoreInt64(&s.testRunning, 0)
-
 		// Создаем таймаут-контекст для выполнения команды
 		const timeout = 100 * time.Second
 		testCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -290,243 +297,60 @@ func (s *Service) handleTestAsync(ctx context.Context) {
 	}()
 }
 
-// handleTest отправляет тестовое сообщение админу, чтобы проверить связность.
-// Логика:
-//  1. переводим статус в online (status.GoOnline),
-//  2. резолвим adminID из конфигурации и получаем InputPeer через кэш,
-//  3. ждём восстановления соединения (WaitOnline),
-//  4. готовим детерминированный random_id для идемпотентности,
-//  5. отправляем сообщение через MessagesSendMessage.
+// handleTest отправляет тестовое сообщение админу, чтобы проверить связность
 func (s *Service) handleTest(ctx context.Context) {
-	logger.Info("CLI test command invoked")
-
-	if s.peers == nil {
-		logger.Error("peers manager is not available")
+	result, err := s.executor.Test(ctx)
+	if err != nil {
+		logger.Errorf("CLI test command failed: %v", err)
 		return
 	}
 
-	adminID := int64(config.Env().AdminUID)
-	if adminID <= 0 {
-		logger.Error("CLI test command: admin UID is not configured")
+	if result.Success {
+		logger.Info(result.Message)
 	}
-
-	currentTime := time.Now().Format(time.RFC3339)
-	message := fmt.Sprintf("Test message from CLI at %s", currentTime)
-
-	// Пытаемся отправить сообщение с повторными попытками при сетевых ошибках
-	const maxRetries = 3
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		connection.WaitOnline(ctx)
-		status.GoOnline()
-
-		peer, errPeer := s.peers.InputPeerByKind(ctx, filters.RecipientTypeUser.String(), adminID)
-		if errPeer != nil {
-			logger.Errorf("CLI test command: resolve admin peer failed: %v", errPeer)
-			return
-		}
-
-		// Формируем получателя в терминах доменной модели уведомлений.
-		recipient := filters.Recipient{Type: filters.RecipientTypeUser, PeerID: filters.RecipientPeerID(adminID)}
-		job := notifications.Job{
-			ID:        time.Now().UnixNano(),
-			CreatedAt: time.Now(),
-		}
-		randomID := notifications.RandomIDForMessage(job, recipient)
-
-		// Готовим запрос отправки сообщения. Текст простой, без entities.
-		req := &tg.MessagesSendMessageRequest{
-			Peer:     peer,
-			Message:  message,
-			RandomID: randomID,
-		}
-
-		_, apiErr := s.client.API().MessagesSendMessage(ctx, req)
-		if apiErr == nil {
-			logger.Infof("CLI test command: message sent successfully after %d attempt(s)", attempt)
-			lastErr = nil
-			break
-		} else {
-			lastErr = apiErr
-		}
-
-		// Проверяем, является ли ошибка сетевой
-		handled := connection.HandleError(apiErr)
-
-		if handled {
-			// Это сетевая ошибка, ожидаем восстановления соединения
-			logger.Infof("CLI test command: network error occurred (attempt %d), waiting for connection: %v",
-				attempt, apiErr)
-			// connection.WaitOnline уже внутри вызова, но в случае сетевой ошибки
-			// может потребоваться дополнительное ожидание
-			if attempt < maxRetries {
-				// Краткая пауза перед повторной попыткой
-				select {
-				case <-time.After(time.Second):
-				case <-ctx.Done():
-					logger.Info("CLI test command: context cancelled during retry delay")
-					return
-				}
-				continue
-			}
-		}
-	}
-
-	if lastErr != nil {
-		logger.Errorf("CLI test command: all attempts failed, final error: %v", lastErr)
-	}
-
-	logger.Info("CLI test command: complited")
 }
 
-// handleStatus печатает агрегированное состояние очереди уведомлений: размеры, метки времени
-// последнего дренирования и флаша, а также следующего планового тика. Временные метки
-// приводятся к локальной таймзоне, заданной в статистике очереди.
-func (s *Service) handleStatus() {
-	if s.notif == nil {
-		pr.ErrPrintln("queue is not available")
+// handleStatus печатает агрегированное состояние очереди уведомлений
+func (s *Service) handleStatus(ctx context.Context) {
+	result, err := s.executor.Status(ctx)
+	if err != nil {
+		pr.ErrPrintln("status error:", err)
 		return
 	}
-	st := s.notif.Stats()
-	pr.Printf("Queue status: urgent=%d regular=%d\n", st.Urgent, st.Regular)
-	if !st.LastRegularDrainAt.IsZero() {
-		pr.Printf("Last regular drain: %s\n", st.LastRegularDrainAt.In(st.Location).Format(time.RFC3339))
+
+	pr.Printf("Queue status: urgent=%d regular=%d\n", result.UrgentQueueSize, result.RegularQueueSize)
+	if !result.LastRegularDrainAt.IsZero() {
+		pr.Printf("Last regular drain: %s\n",
+			result.LastRegularDrainAt.In(result.Location).Format("2006-01-02 15:04:05"))
 	} else {
 		pr.Println("Last regular drain: <never>")
 	}
-	if !st.LastFlushAt.IsZero() {
-		pr.Printf("Last persist: %s\n", st.LastFlushAt.In(st.Location).Format(time.RFC3339))
+	if !result.LastFlushAt.IsZero() {
+		pr.Printf("Last persist: %s\n", result.LastFlushAt.In(result.Location).Format("2006-01-02 15:04:05"))
 	} else {
 		pr.Println("Last persist: <never>")
 	}
-	pr.Printf("Next schedule tick: %s\n", st.NextScheduleAt.In(st.Location).Format(time.RFC3339))
+	pr.Printf("Next schedule tick: %s\n", result.NextScheduleAt.In(result.Location).Format("2006-01-02 15:04:05"))
 }
 
-// listDialogs выводит офлайн-снимок диалогов без сетевых запросов.
-func (s *Service) listDialogs(ctx context.Context) {
-	if s.peers == nil {
-		pr.ErrPrintln("peers manager is not available")
-		return
-	}
-
-	dialogs := s.peers.Dialogs()
-	if len(dialogs) == 0 {
-		pr.Println("No dialogs cached yet.")
-		return
-	}
-
-	for _, item := range dialogs {
-		s.printDialog(ctx, item)
-	}
-	pr.Printf("Total dialogs: %d\n", len(dialogs))
-}
-
-func (s *Service) printDialog(ctx context.Context, ref peersmgr.DialogRef) {
-	var (
-		rawUser    *tg.User
-		rawChat    *tg.Chat
-		rawChannel *tg.Channel
-	)
-
-	if s.peers != nil {
-		if resolved, ok, err := s.peers.ResolvePeer(ctx, ref.Kind, ref.ID); err != nil {
-			logger.Debugf("CLI list: resolve %s:%d failed: %v", ref.Kind, ref.ID, err)
-		} else if ok {
-			switch v := resolved.(type) {
-			case peers.User:
-				rawUser = v.Raw()
-			case peers.Chat:
-				rawChat = v.Raw()
-			case peers.Channel:
-				rawChannel = v.Raw()
-			}
+// printDialog печатает информацию о диалоге
+func (s *Service) printDialog(d commands.Dialog) {
+	switch d.Kind {
+	case "user":
+		pr.Printf("User: '%s' (@%s) id: %d\n", d.Title, d.Username, d.ID)
+	case "chat":
+		pr.Printf("Chat: '%s' id: %d\n", d.Title, d.ID)
+	case "channel":
+		label := d.Type
+		if label == "" {
+			label = "Channel-like"
 		}
-	}
-
-	switch ref.Kind {
-	case peersmgr.DialogKindUser:
-		s.printUser(ref.ID, rawUser)
-	case peersmgr.DialogKindChat:
-		s.printChat(ref.ID, rawChat)
-	case peersmgr.DialogKindChannel:
-		s.printChannel(ref.ID, rawChannel)
-	case peersmgr.DialogKindFolder:
-		pr.Printf("Folder: id: %d\n", ref.ID)
+		pr.Printf("%s: '%s' (@%s) id: %d\n", label, d.Title, d.Username, d.ID)
+	case "folder":
+		pr.Printf("Folder: id: %d\n", d.ID)
 	default:
-		pr.Printf("Unknown dialog kind %q id: %d\n", ref.Kind, ref.ID)
+		pr.Printf("Unknown dialog kind %q id: %d\n", d.Kind, d.ID)
 	}
-}
-
-func (s *Service) printUser(id int64, raw *tg.User) {
-	if raw == nil {
-		pr.Printf("User: id: %d (no cached metadata)\n", id)
-		return
-	}
-	first := strings.TrimSpace(raw.FirstName)
-	last := strings.TrimSpace(raw.LastName)
-	fullName := strings.TrimSpace(strings.Join([]string{first, last}, " "))
-	if fullName == "" {
-		fullName = "<unknown>"
-	}
-	username := strings.TrimPrefix(raw.Username, "@")
-	if username == "" {
-		username = "-"
-	}
-	pr.Printf("User: '%s' (@%s) id: %d\n", fullName, username, id)
-}
-
-func (s *Service) printChat(id int64, raw *tg.Chat) {
-	if raw == nil {
-		pr.Printf("Chat: id: %d (no cached metadata)\n", id)
-		return
-	}
-	title := strings.TrimSpace(raw.Title)
-	if title == "" {
-		title = "<unknown chat>"
-	}
-	pr.Printf("Chat: '%s' id: %d\n", title, id)
-}
-
-func (s *Service) printChannel(id int64, raw *tg.Channel) {
-	if raw == nil {
-		pr.Printf("Channel: id: %d (no cached metadata)\n", id)
-		return
-	}
-
-	title := strings.TrimSpace(raw.Title)
-	if title == "" {
-		title = "<untitled channel>"
-	}
-	username := strings.TrimPrefix(raw.Username, "@")
-	if username == "" {
-		username = "-"
-	}
-
-	label := "Channel-like"
-	if raw.Broadcast {
-		label = "Channel"
-	} else if raw.Megagroup {
-		label = "Supergroup"
-	}
-	pr.Printf("%s: '%s' (@%s) id: %d\n", label, title, username, id)
-}
-
-// whoAmI возвращает строку с краткой информацией о текущем аккаунте (имя, username, id).
-// Ошибку получения self оборачивает с контекстом.
-func whoAmI(ctx context.Context, client *telegram.Client) (string, error) {
-	self, err := client.Self(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to get self: %w", err)
-	}
-	fullname := strings.TrimSpace(strings.Join([]string{self.FirstName, self.LastName}, " "))
-	if fullname == "" {
-		fullname = "<unknown>"
-	}
-	if self.Username != "" {
-		return fmt.Sprintf("You are: %s (@%s), id=%d", fullname, self.Username, self.ID), nil
-	}
-	return fmt.Sprintf("You are: %s, id=%d", fullname, self.ID), nil
 }
 
 // joinCommandNames собирает строку имён команд, разделённых запятыми, для короткой подсказки.

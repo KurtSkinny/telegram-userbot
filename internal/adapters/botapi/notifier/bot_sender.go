@@ -13,6 +13,7 @@
 package botapionotifier
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -231,7 +232,7 @@ func (s *BotSender) performSendRich(
 	if err != nil {
 		return false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return false, err
 	}

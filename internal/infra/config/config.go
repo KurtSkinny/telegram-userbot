@@ -34,29 +34,31 @@ import (
 // NB: значения уже проходят минимальную валидацию и нормализацию в loadConfig.
 // В рантайме по месту использования предполагается, что EnvConfig последователен.
 type EnvConfig struct {
-	APIID             int
-	APIHash           string
-	PhoneNumber       string
-	SessionFile       string
-	StateFile         string
-	LogLevel          string
-	ThrottleRPS       int
-	DedupWindowSec    int
-	DebounceEditMS    int
-	TestDC            bool
-	BotToken          string
-	AdminUID          int
-	Notifier          string
-	NotifyQueueFile   string
-	NotifyFailedFile  string
-	NotifyTimezone    string
-	AppTimezone       string
-	NotifySchedule    []string
+	APIID          int
+	APIHash        string
+	PhoneNumber    string
+	SessionFile    string
+	StateFile      string
+	LogLevel       string
+	ThrottleRPS    int
+	DedupWindowSec int
+	DebounceEditMS int
+	TestDC         bool
+	BotToken       string
+	AdminUID       int
+	AppTimezone    string
+	FiltersFile    string
+	RecipientsFile string
+	PeersCacheFile string
+	// Notification settings
+	Notifier         string
+	NotifyQueueFile  string
+	NotifyFailedFile string
+	NotifyTimezone   string
+	NotifySchedule   []string
+	// Notification cache settings
 	NotifiedCacheFile string
 	NotifiedTTLDays   int
-	FiltersFile       string
-	PeersCacheFile    string
-	RecipientsFile    string // НОВОЕ
 	// Файловое логирование
 	LogFile           string
 	LogFileLevel      string
@@ -64,6 +66,9 @@ type EnvConfig struct {
 	LogFileMaxBackups int
 	LogFileMaxAge     int
 	LogFileCompress   bool
+	// Web Server
+	WebServerEnable  bool
+	WebServerAddress string
 }
 
 // Config хранит конфигурацию среды.
@@ -101,6 +106,9 @@ const (
 	defaultLogFileMaxBackups = 3
 	defaultLogFileMaxAge     = 7
 	defaultLogFileCompress   = true
+	// Web Server
+	defaultWebServerEnable  = false
+	defaultWebServerAddress = "127.0.0.1:8080"
 )
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
@@ -187,6 +195,10 @@ func loadConfig(envPath string) (*Config, error) {
 	logFileMaxBackups := parseIntDefault("LOG_FILE_MAX_BACKUPS", defaultLogFileMaxBackups, nonNegative, &warnings)
 	logFileMaxAge := parseIntDefault("LOG_FILE_MAX_AGE_DAYS", defaultLogFileMaxAge, nonNegative, &warnings)
 	logFileCompress := parseBoolDefault("LOG_FILE_COMPRESS", defaultLogFileCompress, &warnings)
+	// Web Server
+	webServerEnable := parseBoolDefault("WEB_SERVER_ENABLE", defaultWebServerEnable, &warnings)
+	webServerAddress := sanitizeFile("WEB_SERVER_ADDRESS", os.Getenv("WEB_SERVER_ADDRESS"),
+		defaultWebServerAddress, &warnings)
 
 	env := EnvConfig{
 		APIID:             apiID,
@@ -218,6 +230,9 @@ func loadConfig(envPath string) (*Config, error) {
 		LogFileMaxBackups: logFileMaxBackups,
 		LogFileMaxAge:     logFileMaxAge,
 		LogFileCompress:   logFileCompress,
+		// Web Server
+		WebServerEnable:  webServerEnable,
+		WebServerAddress: webServerAddress,
 	}
 
 	cfg := &Config{

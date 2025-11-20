@@ -13,6 +13,8 @@ import (
 
 	"telegram-userbot/internal/adapters/cli"
 	"telegram-userbot/internal/adapters/telegram/core"
+	"telegram-userbot/internal/adapters/web"
+	"telegram-userbot/internal/domain/commands"
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
 	domainupdates "telegram-userbot/internal/domain/updates"
@@ -49,10 +51,16 @@ type Runner struct {
 	mainCtx       context.Context           // Внешний контекст процесса: отменяется по Ctrl+C/сигналам.
 	mainCancel    context.CancelFunc        // Функция, инициирующая общий shutdown (используется из узлов).
 	peers         *peersmgr.Service         // Сервис пиров (peers.Manager + persist storage).
+	cmdExecutor   commands.Executor         // Исполнитель команд (используется CLI и Web).
 	cliService    *cli.Service              // CLI сервис для интерактивных команд.
+	webServer     *web.Server               // Web-сервер для управления через браузер.
 	updatesWG     sync.WaitGroup            // WaitGroup для updates_manager.
 	updatesCancel context.CancelFunc        // Функция отмены контекста для updates_manager.
 }
+
+const (
+	webServerShutdownTimeout = 10 * time.Second
+)
 
 // NewRunner подготавливает Runner с переданными зависимостями: ядро клиента, очередь уведомлений,
 // утилиты конкуррентности и доменные обработчики. Возвращает объект, готовый к запуску Run().
@@ -176,11 +184,32 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 }
 
 func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager, selfID int64) error {
+	// command executor
+	logger.Debug("initializing command executor")
+	r.cmdExecutor = commands.NewExecutor(r.client, r.filters, r.notif, r.peers)
+	logger.Debug("command executor initialized")
+
 	// cli
 	logger.Debug("starting service cli")
-	r.cliService = cli.NewService(r.client, r.mainCancel, r.filters, r.notif, r.peers)
+	r.cliService = cli.NewService(r.cmdExecutor, r.mainCancel)
 	r.cliService.Start(ctx)
 	logger.Debug("service cli started")
+
+	// web server (если включен)
+	if config.Env().WebServerEnable {
+		logger.Debug("starting service web_server")
+		r.webServer = web.NewServer(r.cmdExecutor)
+
+		// Передаем webServer в handlers для генерации auth токенов
+		r.handlers.SetWebAuth(r.webServer)
+
+		go func() {
+			if err := r.webServer.Start(); err != nil {
+				logger.Errorf("web server error: %v", err)
+			}
+		}()
+		logger.Debug("service web_server started")
+	}
 
 	// peers_manager (если есть)
 	// peers уже инициализированы в app.Init, ничего не делаем
@@ -289,6 +318,17 @@ func (r *Runner) stopAllServices() {
 			logger.Errorf("failed to stop peers_manager: %v", err)
 		}
 		logger.Debug("service peers_manager stopped")
+	}
+
+	// web server
+	if r.webServer != nil {
+		logger.Debug("stopping service web_server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), webServerShutdownTimeout)
+		defer cancel()
+		if err := r.webServer.Shutdown(shutdownCtx); err != nil {
+			logger.Errorf("failed to stop web_server: %v", err)
+		}
+		logger.Debug("service web_server stopped")
 	}
 
 	// cli
