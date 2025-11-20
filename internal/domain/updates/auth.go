@@ -7,7 +7,6 @@ import (
 
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/support/debug"
 
 	"github.com/gotd/td/tg"
 )
@@ -65,7 +64,7 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 
 	h.sendReply(ctx, msg, message)
 	logger.Info("Auth link sent to admin")
-	if debug.DEBUG {
+	if logger.IsDebugEnabled() {
 		logger.Infof("Auth link: %s", authURL)
 	}
 }

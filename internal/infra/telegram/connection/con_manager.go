@@ -24,7 +24,6 @@ import (
 
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/storage"
-	"telegram-userbot/internal/support/debug"
 
 	"github.com/gotd/td/pool"
 	"github.com/gotd/td/rpc"
@@ -444,7 +443,7 @@ func isNetworkError(err error) bool {
 		return true
 	}
 
-	if debug.DEBUG {
+	if logger.IsDebugEnabled() {
 		logger.Warnf("isNetworkError: %v", err)
 		logNonNetworkError(err)
 	}
@@ -453,7 +452,7 @@ func isNetworkError(err error) bool {
 }
 
 // networkErrorsLogPath — путь файла, куда пишутся «не сетевые» ошибки для диагностики.
-const networkErrorsLogPath = "/data/isnetworkerrors.log"
+const networkErrorsLogPath = "./logs/isnetworkerrors.log"
 
 // logNonNetworkError добавляет запись в диагностический лог, используя атомарную
 // запись файла. Ошибки чтения/записи логируются на debug‑уровне и не фатальны.

@@ -19,26 +19,13 @@ import (
 
 	tdpeers "github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	"go.uber.org/zap"
 )
-
-// DEBUG — глобальный переключатель режима отладки. Когда false, все функции пакета
-// молчат. Переменная нечитаема из конфигурации автоматически: предполагается,
-// что прод‑сборка запускается с DEBUG=false.
-var DEBUG = true
 
 const textPreviewLimit = 50
 
-// PrintUpdate печатает компактное представление входящего сообщения в консоль.
-// Формат: [prefix] <источник> > <читаемое имя>: <обрезанный текст>.
-// Особенности:
-//   - текст режется до безопасной длины по рунам, чтобы не ломать UTF‑8;
-//   - для пользователей/чатов/каналов имена берутся из peersmgr.Service;
-//   - entities передаются для потенциальных улучшений (сейчас не используются);
-//   - отсутствующие метаданные заменяются плейсхолдерами ("<unknown>").
+// PrintUpdate печатает в лог отладочную информацию об апдейте сообщения msg.
 func PrintUpdate(prefix string, msg *tg.Message, entities tg.Entities, mgr *peersmgr.Service) {
-	if !DEBUG {
-		// Отладка выключена — ничего не делаем. Этот ранний выход упраздняет лишнюю работу.
+	if !logger.IsDebugEnabled() {
 		return
 	}
 	from, name := formatPeer(mgr, msg.PeerID)
@@ -182,33 +169,4 @@ func usernameFromChannel(raw *tg.Channel) string {
 		}
 	}
 	return "-"
-}
-
-// Debug пишет запись уровня Debug в общий лог только при активном DEBUG.
-// Поля передаются как zap.Field для структурированного вывода.
-func Debug(msg string, fields ...zap.Field) {
-	if DEBUG {
-		logger.Logger().Debug(msg, fields...)
-	}
-}
-
-// Info пишет информационную запись при активном DEBUG. Поля — произвольные.
-func Info(msg string, fields ...zap.Field) {
-	if DEBUG {
-		logger.Logger().Info(msg, fields...)
-	}
-}
-
-// Warn пишет предупреждение в лог, если DEBUG=true.
-func Warn(msg string, fields ...zap.Field) {
-	if DEBUG {
-		logger.Logger().Warn(msg, fields...)
-	}
-}
-
-// Error пишет ошибку в лог при активном DEBUG, не паникует и не прерывает выполнение.
-func Error(msg string, fields ...zap.Field) {
-	if DEBUG {
-		logger.Logger().Error(msg, fields...)
-	}
 }

@@ -94,7 +94,7 @@ const (
 	defaultNotifyQueueFile   = "data/notify_queue.json"
 	defaultNotifyFailedFile  = "data/notify_failed.json"
 	defaultNotifyTimezone    = "Europe/Moscow"
-	defaultAppTimezone       = "UTC"
+	defaultAppTimezone       = "Europe/Moscow"
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
