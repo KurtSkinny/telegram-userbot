@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"telegram-userbot/internal/infra/timeutil"
 
@@ -118,6 +119,8 @@ var (
 	cfgDone     bool
 )
 
+var AppLocation *time.Location
+
 // Load — точка входа для инициализации глобальной конфигурации всего приложения.
 // При первом вызове:
 //  1. читает .env,
@@ -199,6 +202,11 @@ func loadConfig(envPath string) (*Config, error) {
 	webServerEnable := parseBoolDefault("WEB_SERVER_ENABLE", defaultWebServerEnable, &warnings)
 	webServerAddress := sanitizeFile("WEB_SERVER_ADDRESS", os.Getenv("WEB_SERVER_ADDRESS"),
 		defaultWebServerAddress, &warnings)
+
+	AppLocation, err = timeutil.ParseLocation(appTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("invalid APP_TIMEZONE %q: %w", appTimezone, err)
+	}
 
 	env := EnvConfig{
 		APIID:             apiID,
