@@ -21,6 +21,7 @@ import (
 	"telegram-userbot/internal/infra/telegram/connection"
 	"telegram-userbot/internal/infra/telegram/peersmgr"
 	"telegram-userbot/internal/infra/telegram/session"
+	"telegram-userbot/internal/infra/timeutil"
 	"telegram-userbot/internal/support/version"
 
 	"github.com/go-faster/errors"
@@ -187,7 +188,7 @@ func (a *App) Run() error {
 	}
 
 	// Таймзона для расписания уведомлений берётся из конфигурации.
-	loc, err := config.ParseLocation(config.Env().NotifyTimezone)
+	loc, err := timeutil.ParseLocation(config.Env().NotifyTimezone)
 	if err != nil {
 		return fmt.Errorf("load notify timezone: %w", err)
 	}

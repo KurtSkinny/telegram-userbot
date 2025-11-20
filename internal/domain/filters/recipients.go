@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"telegram-userbot/internal/infra/timeutil"
 )
 
 type RecipientID string
@@ -95,7 +96,7 @@ func (rt *RecipientTZ) UnmarshalJSON(data []byte) error {
 	}
 	s = strings.TrimSpace(s)
 	if s != "" {
-		if _, err := ParseLocation(s); err != nil {
+		if _, err := timeutil.ParseLocation(s); err != nil {
 			return fmt.Errorf("invalid timezone: %s", s)
 		}
 	}
@@ -112,7 +113,7 @@ func (rs *RecipientSchedule) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s = strings.TrimSpace(s)
-	if s != "" && !IsValidScheduleEntry(s) {
+	if s != "" && !timeutil.IsValidScheduleEntry(s) {
 		return fmt.Errorf("invalid schedule entry: %s", s)
 	}
 	*rs = RecipientSchedule(s)
@@ -164,55 +165,6 @@ func LoadRecipients(filePath string) ([]Recipient, error) {
 	return recipients, nil
 }
 
-// IsValidScheduleEntry проверяет формат времени HH:MM и диапазоны часов/минут.
-// Это копия функции из config пакета
-func IsValidScheduleEntry(value string) bool {
-	if len(value) != 5 || value[2] != ':' {
-		return false
-	}
-	hour, err := strconv.Atoi(value[:2])
-	if err != nil {
-		return false
-	}
-	minute, err := strconv.Atoi(value[3:])
-	if err != nil {
-		return false
-	}
-	if hour < 0 || hour > 23 {
-		return false
-	}
-	if minute < 0 || minute > 59 {
-		return false
-	}
-	return true
-}
-
-// ParseLocation разбирает либо IANA‑таймзону (например, "Europe/Moscow"),
-// либо UTC‑смещение (например, "+03:00", "-0700", "UTC+3", "GMT-04:30").
-// Это копия функции из config пакета
-func ParseLocation(value string) (*time.Location, error) {
-	v := strings.TrimSpace(value)
-	if v == "" {
-		return nil, errors.New("empty timezone")
-	}
-	// Try IANA first.
-	if loc, err := time.LoadLocation(v); err == nil {
-		return loc, nil
-	}
-	// Try to parse UTC offset forms.
-	if loc, ok := parseUTCOffsetToLocation(v); ok {
-		return loc, nil
-	}
-	return nil, fmt.Errorf("invalid timezone %q: not an IANA name or UTC offset", value)
-}
-
-// constants for time calculations
-const (
-	secondsInMinute = 60
-	secondsInHour   = secondsInMinute * 60
-	hoursInDay      = 24
-)
-
 // CalculateScheduledTime вычисляет время отправки для получателя с учетом его персональных настроек.
 // Для срочных заданий возвращает текущее время. Для обычных - следующий подходящий слот расписания.
 func (r *Recipient) CalculateScheduledTime(
@@ -228,7 +180,7 @@ func (r *Recipient) CalculateScheduledTime(
 	// Определяем эффективную таймзону
 	tz := defaultTZ
 	if r.TZ != "" {
-		if loc, err := ParseLocation(string(r.TZ)); err == nil {
+		if loc, err := timeutil.ParseLocation(string(r.TZ)); err == nil {
 			tz = loc
 		}
 	}
@@ -252,7 +204,7 @@ func nextScheduleAfter(now time.Time, location *time.Location, schedule []string
 
 	// Ищем ближайший слот сегодня
 	for _, timeStr := range schedule {
-		if !IsValidScheduleEntry(timeStr) {
+		if !timeutil.IsValidScheduleEntry(timeStr) {
 			continue
 		}
 		parts := strings.Split(timeStr, ":")
@@ -266,10 +218,12 @@ func nextScheduleAfter(now time.Time, location *time.Location, schedule []string
 		}
 	}
 
+	const hoursInDay = 24
+
 	// Все слоты прошли - берем первый слот следующего дня
 	if len(schedule) > 0 {
 		timeStr := schedule[0]
-		if IsValidScheduleEntry(timeStr) {
+		if timeutil.IsValidScheduleEntry(timeStr) {
 			parts := strings.Split(timeStr, ":")
 			hour, _ := strconv.Atoi(parts[0])
 			minute, _ := strconv.Atoi(parts[1])
@@ -283,48 +237,4 @@ func nextScheduleAfter(now time.Time, location *time.Location, schedule []string
 
 	// Fallback - если расписание пустое, планируем на завтра в это же время
 	return localNow.Add(hoursInDay * time.Hour)
-}
-
-// parseUTCOffsetToLocation парсит строки вида "+03:00", "-0700", "UTC+3", "GMT-04:30" или "Z".
-// Возвращает фиксированную таймзону и ok=true при успешном разборе.
-// Это копия функции из config пакета
-func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
-	v := strings.TrimSpace(strings.ToUpper(value))
-	if v == "Z" || v == "UTC" || v == "GMT" {
-		return time.FixedZone("UTC+00:00", 0), true
-	}
-	// Normalize optional UTC/GMT prefix
-	v = strings.TrimPrefix(v, "UTC")
-	v = strings.TrimPrefix(v, "GMT")
-	v = strings.TrimSpace(v)
-	// Patterns: +HH, -HH, +HHMM, -HHMM, +HH:MM, -HH:MM
-	re := regexp.MustCompile(`^([+-])\s*(\d{1,2})(?::?(\d{2}))?$`)
-	m := re.FindStringSubmatch(v)
-	if m == nil {
-		return nil, false
-	}
-	sign := 1
-	if m[1] == "-" {
-		sign = -1
-	}
-	hourStr := m[2]
-	minStr := m[3]
-	hours, err := strconv.Atoi(hourStr)
-	if err != nil {
-		return nil, false
-	}
-	mins := 0
-	if minStr != "" {
-		var err2 error
-		mins, err2 = strconv.Atoi(minStr)
-		if err2 != nil {
-			return nil, false
-		}
-	}
-	if hours < 0 || hours > 14 || mins < 0 || mins > 59 {
-		return nil, false
-	}
-	offset := sign * ((hours * secondsInHour) + (mins * secondsInMinute))
-	name := fmt.Sprintf("UTC%+03d:%02d", sign*hours, mins)
-	return time.FixedZone(name, offset), true
 }

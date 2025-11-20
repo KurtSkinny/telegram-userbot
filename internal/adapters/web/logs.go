@@ -12,6 +12,7 @@ import (
 
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
+	"telegram-userbot/internal/infra/timeutil"
 )
 
 // LogEntry представляет одну запись лога
@@ -180,37 +181,14 @@ func parseLogLine(line string) (LogEntry, error) {
 
 	if timeStr != "" {
 		// Получаем таймзону из конфига
-		cfg := config.Env()
-		loc, err := config.ParseLocation(cfg.AppTimezone)
+		loc, err := timeutil.ParseLocation(config.Env().AppTimezone)
 		if err != nil {
 			// Если не удалось загрузить таймзону, используем UTC
 			loc = time.UTC
 		}
 
-		// Пробуем различные форматы timestamp
-		var t time.Time
-		var parseErr error
-
-		layouts := []string{
-			"2006-01-02T15:04:05.999-0700", // zap: millis + timezone без двоеточия
-			"2006-01-02T15:04:05-0700",     // zap: без миллисекунд
-			time.RFC3339,                   // ISO с ":" в таймзоне
-			time.RFC3339Nano,               // nano
-		}
-
-		for _, layout := range layouts {
-			if t, parseErr = time.Parse(layout, timeStr); parseErr == nil {
-				break
-			}
-		}
-
-		if parseErr == nil {
-			// Конвертируем в нужную таймзону и форматируем
-			ts = t.In(loc).Format("2006-01-02 15:04:05")
-		} else {
-			// Если не удалось распарсить, показываем как есть
-			ts = timeStr
-		}
+		// Используем универсальную функцию для парсинга и форматирования
+		ts = timeutil.NormalizeLogTimestamp(timeStr, loc)
 	}
 
 	return LogEntry{

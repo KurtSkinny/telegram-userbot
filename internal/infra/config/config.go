@@ -17,12 +17,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+
+	"telegram-userbot/internal/infra/timeutil"
 
 	"github.com/joho/godotenv"
 )
@@ -373,25 +373,6 @@ func sanitizeFile(name, value, fallback string, warnings *[]string) string {
 	return v
 }
 
-// ParseLocation разбирает либо IANA‑таймзону (например, "Europe/Moscow"),
-// либо UTC‑смещение (например, "+03:00", "-0700", "UTC+3", "GMT-04:30").
-// Возвращает *time.Location или ошибку.
-func ParseLocation(value string) (*time.Location, error) {
-	v := strings.TrimSpace(value)
-	if v == "" {
-		return nil, errors.New("empty timezone")
-	}
-	// Try IANA first.
-	if loc, err := time.LoadLocation(v); err == nil {
-		return loc, nil
-	}
-	// Try to parse UTC offset forms.
-	if loc, ok := parseUTCOffsetToLocation(v); ok {
-		return loc, nil
-	}
-	return nil, fmt.Errorf("invalid timezone %q: not an IANA name or UTC offset", value)
-}
-
 // sanitizeTimezoneFlexible проверяет, что значение — корректная IANA‑зона или UTC‑смещение.
 // При неудаче возвращает значение по умолчанию и добавляет предупреждение.
 func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string) string {
@@ -400,58 +381,11 @@ func sanitizeTimezoneFlexible(value string, fallback string, warnings *[]string)
 		appendWarningf(warnings, "env %s is not set; using default %q", "<timezone>", fallback)
 		return fallback
 	}
-	if _, err := ParseLocation(v); err != nil {
+	if _, err := timeutil.ParseLocation(v); err != nil {
 		appendWarningf(warnings, "timezone %q is invalid; using default %q", v, fallback)
 		return fallback
 	}
 	return v
-}
-
-// parseUTCOffsetToLocation парсит строки вида "+03:00", "-0700", "UTC+3", "GMT-04:30" или "Z".
-// Возвращает фиксированную таймзону и ok=true при успешном разборе.
-func parseUTCOffsetToLocation(value string) (*time.Location, bool) {
-	v := strings.TrimSpace(strings.ToUpper(value))
-	if v == "Z" || v == "UTC" || v == "GMT" {
-		return time.FixedZone("UTC+00:00", 0), true
-	}
-	// Normalize optional UTC/GMT prefix
-	v = strings.TrimPrefix(v, "UTC")
-	v = strings.TrimPrefix(v, "GMT")
-	v = strings.TrimSpace(v)
-	// Patterns: +HH, -HH, +HHMM, -HHMM, +HH:MM, -HH:MM
-	re := regexp.MustCompile(`^([+-])\s*(\d{1,2})(?::?(\d{2}))?$`)
-	m := re.FindStringSubmatch(v)
-	if m == nil {
-		return nil, false
-	}
-	sign := 1
-	if m[1] == "-" {
-		sign = -1
-	}
-	hourStr := m[2]
-	minStr := m[3]
-	hours, err := strconv.Atoi(hourStr)
-	if err != nil {
-		return nil, false
-	}
-	mins := 0
-	if minStr != "" {
-		var err2 error
-		mins, err2 = strconv.Atoi(minStr)
-		if err2 != nil {
-			return nil, false
-		}
-	}
-	if hours < 0 || hours > 14 || mins < 0 || mins > 59 {
-		return nil, false
-	}
-	const (
-		secInHour = 60 * 60
-		secInMin  = 60
-	)
-	offset := sign * ((hours * secInHour) + (mins * secInMin))
-	name := fmt.Sprintf("UTC%+03d:%02d", sign*hours, mins)
-	return time.FixedZone(name, offset), true
 }
 
 // sanitizeSchedule парсит CSV-строку формата "HH:MM,HH:MM,...", фильтрует
@@ -472,7 +406,7 @@ func sanitizeSchedule(value string, fallback []string, warnings *[]string) []str
 		if token == "" {
 			continue
 		}
-		if !isValidScheduleEntry(token) {
+		if !timeutil.IsValidScheduleEntry(token) {
 			appendWarningf(warnings, "env NOTIFY_SCHEDULE entry %q is invalid; expected HH:MM", token)
 			continue
 		}
@@ -494,29 +428,6 @@ func sanitizeSchedule(value string, fallback []string, warnings *[]string) []str
 		final = append(final, token)
 	}
 	return final
-}
-
-// isValidScheduleEntry проверяет формат времени HH:MM и диапазоны часов/минут.
-// Это простая синтаксическая проверка, логика исполнения расписания — снаружи.
-func isValidScheduleEntry(value string) bool {
-	if len(value) != 5 || value[2] != ':' {
-		return false
-	}
-	hour, err := strconv.Atoi(value[:2])
-	if err != nil {
-		return false
-	}
-	minute, err := strconv.Atoi(value[3:])
-	if err != nil {
-		return false
-	}
-	if hour < 0 || hour > 23 {
-		return false
-	}
-	if minute < 0 || minute > 59 {
-		return false
-	}
-	return true
 }
 
 // cloneStrings создаёт копию среза строк. Используется, чтобы не делиться
