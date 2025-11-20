@@ -507,6 +507,18 @@ func (q *Queue) FlushImmediately(reason string) {
 	if reason == "" {
 		reason = "manual flush"
 	}
+	logger.Debugf("Queue: force flush requested (%s)", reason)
+	
+	// Принудительно обновляем ScheduledAt всех regular заданий на текущее время
+	// чтобы они были обработаны немедленно
+	q.mu.Lock()
+	now := q.now()
+	for i := range q.state.Regular {
+		q.state.Regular[i].ScheduledAt = now.Add(-time.Second) // в прошлом, чтобы гарантированно пройти проверку
+	}
+	q.persistLocked()
+	q.mu.Unlock()
+	
 	q.signalRegularDrain(reason)
 }
 

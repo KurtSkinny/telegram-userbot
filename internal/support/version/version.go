@@ -17,5 +17,5 @@ var (
 	Name = "telegram-userbot"
 	// Version — строка версии сборки. Ожидается SemVer вида vMAJOR.MINOR.PATCH либо произвольный тег.
 	// Переопределяется при сборке через -ldflags. Пустая строка может трактоваться как "dev" билды.
-	Version = "v0.9.0"
+	Version = "0.9.0"
 )
