@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"telegram-userbot/internal/app"
+	"telegram-userbot/internal/infra/concurrency"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
@@ -24,6 +25,8 @@ func main() {
 
 	// envPath определяет расположение .env с секретами и общими настройками.
 	envPath := flag.String("env", "assets/.env", "path to .env file")
+	envTimeout := flag.Int("timeout", 0, "application timeout in seconds (0 means no timeout)")
+
 	// // filtersPath указывает на JSON-файл с фильтрами, используемыми userbot.
 	flag.Parse()
 
@@ -48,6 +51,11 @@ func main() {
 	// Создаём контекст приложения, который будет отменён при получении сигнала завершения.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Запускаем таймер авто-выключения, если указан таймаут.
+	if err := concurrency.StartTimeoutTimer(ctx, *envTimeout, cancel); err != nil {
+		logger.Fatal("failed to start timeout timer", zap.Error(err))
+	}
 
 	// Создаём и запускаем приложение.
 	a := app.NewApp(ctx, cancel)
