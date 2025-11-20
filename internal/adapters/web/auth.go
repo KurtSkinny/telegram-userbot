@@ -112,3 +112,10 @@ func (am *AuthManager) GetCurrentToken() string {
 	defer am.mu.RUnlock()
 	return am.token
 }
+
+// DeleteCurrentToken удаляет текущий активный токен
+func (am *AuthManager) DeleteCurrentToken() {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	am.token = ""
+}

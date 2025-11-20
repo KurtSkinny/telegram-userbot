@@ -28,6 +28,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 					HttpOnly: true,
 					SameSite: http.SameSiteStrictMode,
 				})
+				// Удаляем активный токен после успешного использования
+				s.auth.DeleteCurrentToken()
 				// Редирект на главную без токена в URL
 				http.Redirect(w, r, "/", http.StatusSeeOther)
 				return
