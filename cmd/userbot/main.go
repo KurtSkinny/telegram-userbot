@@ -14,6 +14,7 @@ import (
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/pr"
+	"telegram-userbot/internal/infra/timeutil"
 )
 
 func main() {
@@ -31,7 +32,7 @@ func main() {
 		logger.Fatal("failed to load config", zap.Error(err))
 	}
 	// Применяем часовую зону приложения (поддерживает IANA и UTC‑смещение). Влияет глобально на time.Local.
-	if locApp, err := config.ParseLocation(config.Env().AppTimezone); err != nil {
+	if locApp, err := timeutil.ParseLocation(config.Env().AppTimezone); err != nil {
 		logger.Fatal("failed to parse APP_TIMEZONE", zap.Error(err))
 	} else {
 		time.Local = locApp //nolint:reassign // намеренно задаём часовую зону процесса (приложение работает в выбранной TZ)
