@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"telegram-userbot/internal/infra/apptime"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 
@@ -42,7 +43,7 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 		logger.Debugf("Auth command rate limited, wait %v", waitTime)
 		return
 	}
-	h.lastAuthTime = time.Now()
+	h.lastAuthTime = apptime.Now()
 	h.authMu.Unlock()
 
 	// Генерируем новый токен
@@ -110,7 +111,7 @@ func (h *Handlers) sendReply(ctx context.Context, msg *tg.Message, text string) 
 	}
 
 	// Генерируем RandomID для идемпотентности
-	randomID := time.Now().UnixNano()
+	randomID := apptime.Now().UnixNano()
 
 	_, err := h.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 		Peer:     inputPeer,

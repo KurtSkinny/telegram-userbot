@@ -104,7 +104,7 @@ func IsValidScheduleEntry(value string) bool {
 // и возвращает его в виде "2006-01-02 15:04:05" в указанной таймзоне.
 // Если разбор не удался, возвращается исходная строка.
 func NormalizeLogTimestamp(timeStr string, loc *time.Location) string {
-	if timeStr == "" {
+	if timeStr == "" || loc == nil {
 		return ""
 	}
 	var t time.Time
@@ -128,10 +128,6 @@ func NormalizeLogTimestamp(timeStr string, loc *time.Location) string {
 	if err != nil {
 		// Не удалось распарсить ни одним из форматов
 		return timeStr
-	}
-	// Если таймзона не задана, используем UTC
-	if loc == nil {
-		loc = time.UTC
 	}
 	return t.In(loc).Format(outputLayout)
 }

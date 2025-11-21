@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
@@ -180,15 +179,7 @@ func parseLogLine(line string) (LogEntry, error) {
 	}
 
 	if timeStr != "" {
-		// Получаем таймзону из конфига
-		loc, err := timeutil.ParseLocation(config.Env().AppTimezone)
-		if err != nil {
-			// Если не удалось загрузить таймзону, используем UTC
-			loc = time.UTC
-		}
-
-		// Используем универсальную функцию для парсинга и форматирования
-		ts = timeutil.NormalizeLogTimestamp(timeStr, loc)
+		ts = timeutil.NormalizeLogTimestamp(timeStr, config.AppLocation)
 	}
 
 	return LogEntry{

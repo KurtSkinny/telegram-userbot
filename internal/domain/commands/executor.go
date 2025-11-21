@@ -10,6 +10,7 @@ import (
 
 	"telegram-userbot/internal/domain/filters"
 	"telegram-userbot/internal/domain/notifications"
+	"telegram-userbot/internal/infra/apptime"
 	"telegram-userbot/internal/infra/config"
 	"telegram-userbot/internal/infra/logger"
 	"telegram-userbot/internal/infra/telegram/connection"
@@ -205,7 +206,7 @@ func (e *CommandExecutor) Test(ctx context.Context) (*TestResult, error) {
 		return nil, errors.New("admin UID is not configured")
 	}
 
-	currentTime := time.Now()
+	currentTime := apptime.Now()
 	message := fmt.Sprintf("Test message from userbot at %s", currentTime.Format(time.RFC3339))
 
 	// Пытаемся отправить сообщение с повторными попытками
@@ -224,8 +225,8 @@ func (e *CommandExecutor) Test(ctx context.Context) (*TestResult, error) {
 		// Формируем получателя
 		recipient := filters.Recipient{Type: filters.RecipientTypeUser, PeerID: filters.RecipientPeerID(adminID)}
 		job := notifications.Job{
-			ID:        time.Now().UnixNano(),
-			CreatedAt: time.Now(),
+			ID:        apptime.Now().UnixNano(),
+			CreatedAt: apptime.Now(),
 		}
 		randomID := notifications.RandomIDForMessage(job, recipient)
 

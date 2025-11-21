@@ -1,11 +1,13 @@
+// Package clock DEPRECATED: используйте пакет apptime вместо этого
+// Этот пакет оставлен для обратной совместимости
 package clock
 
 import (
-	"telegram-userbot/internal/infra/config"
+	"telegram-userbot/internal/infra/apptime"
 	"time"
 )
 
-// Now возвращает текущее время в глобальной таймзоне приложения.
+// Now DEPRECATED: используйте apptime.Now() вместо этого
 func Now() time.Time {
-	return time.Now().In(config.AppLocation)
+	return apptime.Now()
 }
