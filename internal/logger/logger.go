@@ -99,23 +99,24 @@ func rebuildLoggerLocked() {
 // Init инициализирует глобальный zap-логгер и настраивает уровень.
 // Допустимые уровни: debug, info (по умолчанию), warn, error. Значение сравнивается без учёта регистра.
 // Encoder берётся из defaultEncoderConfig. Потокобезопасно.
-func Init() {
+func Init(cfg *config.Config) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Читаем конфигурацию файлового логирования
-	env := config.Env()
+	env := cfg.GetEnv()
 
 	// Устанавливаем уровень консольного логирования
 	switch strings.ToLower(env.LogLevel) {
 	case "debug":
 		logLevel.SetLevel(zap.DebugLevel)
+	case "info":
+		logLevel.SetLevel(zap.InfoLevel)
 	case "warn":
 		logLevel.SetLevel(zap.WarnLevel)
 	case "error":
 		logLevel.SetLevel(zap.ErrorLevel)
 	default:
-		logLevel.SetLevel(zap.InfoLevel)
+		logLevel.SetLevel(zap.InfoLevel) // fallback
 	}
 
 	// Инициализируем файловое логирование, если указан путь к файлу
@@ -126,6 +127,7 @@ func Init() {
 			MaxBackups: env.LogFileMaxBackups,
 			MaxAge:     env.LogFileMaxAge, // дни
 			Compress:   env.LogFileCompress,
+			LocalTime:  true,
 		}
 		fileWriter = lumberjackLogger
 
@@ -133,12 +135,14 @@ func Init() {
 		switch strings.ToLower(env.LogFileLevel) {
 		case "debug":
 			fileLevel.SetLevel(zap.DebugLevel)
+		case "info":
+			fileLevel.SetLevel(zap.InfoLevel)
 		case "warn":
 			fileLevel.SetLevel(zap.WarnLevel)
 		case "error":
 			fileLevel.SetLevel(zap.ErrorLevel)
 		default:
-			fileLevel.SetLevel(zap.InfoLevel)
+			fileLevel.SetLevel(zap.DebugLevel)
 		}
 	} else {
 		// Отключаем файловое логирование

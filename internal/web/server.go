@@ -16,6 +16,7 @@ import (
 
 // Server представляет веб-сервер
 type Server struct {
+	cfg          *config.Config
 	srv          *http.Server
 	auth         *AuthManager
 	executor     commands.Executor
@@ -34,11 +35,12 @@ const (
 )
 
 // NewServer создает новый веб-сервер
-func NewServer(executor commands.Executor) *Server {
+func NewServer(cfg *config.Config, executor commands.Executor) *Server {
 	// Создаем auth manager с TTL 1 час
 	auth := NewAuthManager(time.Hour)
 
 	s := &Server{
+		cfg:      cfg,
 		auth:     auth,
 		executor: executor,
 	}
@@ -74,7 +76,7 @@ func NewServer(executor commands.Executor) *Server {
 	mux.Handle("/", s.authMiddleware(protected))
 
 	// HTTP сервер
-	addr := config.Env().WebServerAddress
+	addr := cfg.GetEnv().WebServerAddress
 	s.srv = &http.Server{
 		Addr:         addr,
 		Handler:      loggingMiddleware(mux),

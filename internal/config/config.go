@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"telegram-userbot/internal/timeutil"
 
@@ -114,34 +113,14 @@ const (
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
 
-var (
-	cfgInstance *Config
-	cfgDone     bool
-)
-
-var AppLocation *time.Location
-
-// Load — точка входа для инициализации глобальной конфигурации всего приложения.
-// При первом вызове:
-//  1. читает .env,
-//  2. формирует EnvConfig,
-//  4. фиксирует результат в singleton cfgInstance.
-//
-// Повторный вызов запрещен (возвращается ошибка), чтобы избежать гонок
-// конфигурации на старте.
-func Load(envPath string) error {
-	if cfgDone {
-		return errors.New("config already loaded")
+// Load читает конфигурацию из .env файла и возвращает новый экземпляр Config.
+// Может быть вызвана многократно для создания разных конфигураций (например, в тестах).
+func Load(envPath string) (*Config, error) {
+	cfg, err := loadConfig(envPath)
+	if err != nil {
+		return nil, err
 	}
-	if cfgInstance == nil {
-		cfgInstance = &Config{}
-	}
-	cfgInstance.mu.Lock()
-	defer cfgInstance.mu.Unlock()
-	newCfg, err := loadConfig(envPath)
-	cfgInstance = newCfg
-	cfgDone = true
-	return err
+	return cfg, nil
 }
 
 // loadConfig выполняет фактическую загрузку/валидацию без установки глобального
@@ -203,7 +182,6 @@ func loadConfig(envPath string) (*Config, error) {
 	webServerAddress := sanitizeFile("WEB_SERVER_ADDRESS", os.Getenv("WEB_SERVER_ADDRESS"),
 		defaultWebServerAddress, &warnings)
 
-	AppLocation, err = timeutil.ParseLocation(appTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("invalid APP_TIMEZONE %q: %w", appTimezone, err)
 	}
@@ -254,18 +232,20 @@ func loadConfig(envPath string) (*Config, error) {
 
 // Warnings возвращает накопленные предупреждения, возникшие при загрузке .env
 // (например, когда подставлено значение по умолчанию). Возвращается копия.
-func Warnings() []string {
-	cfgInstance.mu.RLock()
-	defer cfgInstance.mu.RUnlock()
-	result := make([]string, len(cfgInstance.warnings))
-	copy(result, cfgInstance.warnings)
+func (c *Config) Warnings() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]string, len(c.warnings))
+	copy(result, c.warnings)
 	return result
 }
 
-// Env возвращает EnvConfig из глобального singleton. Это неизменяемый снимок
+// GetEnv возвращает EnvConfig из этого экземпляра Config. Это неизменяемый снимок
 // на момент последней загрузки; для обновления надо перечитать конфиг целиком.
-func Env() EnvConfig {
-	return cfgInstance.Env
+func (c *Config) GetEnv() EnvConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Env
 }
 
 // parseRequiredInt читает обязательную целочисленную переменную окружения name.

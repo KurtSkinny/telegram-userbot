@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -15,7 +14,6 @@ import (
 	"telegram-userbot/internal/config"
 	"telegram-userbot/internal/logger"
 	"telegram-userbot/internal/pr"
-	"telegram-userbot/internal/timeutil"
 )
 
 func main() {
@@ -31,20 +29,15 @@ func main() {
 	flag.Parse()
 
 	// config.Load загружает конфигурацию из .env и других источников.
-	if err := config.Load(*envPath); err != nil {
-		logger.Fatal("failed to load config", zap.Error(err))
-	}
-	// Применяем часовую зону приложения (поддерживает IANA и UTC‑смещение). Влияет глобально на time.Local.
-	if locApp, err := timeutil.ParseLocation(config.Env().AppTimezone); err != nil {
-		logger.Fatal("failed to parse APP_TIMEZONE", zap.Error(err))
-	} else {
-		time.Local = locApp //nolint:reassign // намеренно задаём часовую зону процесса (приложение работает в выбранной TZ)
+	cfg, cfgErr := config.Load(*envPath)
+	if cfgErr != nil {
+		logger.Fatal("failed to load config", zap.Error(cfgErr))
 	}
 
 	// logger.Init задаёт уровень, а SetWriters перенаправляет выводы в подсистему pr (чтобы видеть логи в CLI UI).
-	logger.Init()
+	logger.Init(cfg)
 	logger.SetWriters(pr.Stdout(), pr.Stderr())
-	for _, msg := range config.Warnings() {
+	for _, msg := range cfg.Warnings() {
 		logger.Warn(msg)
 	}
 
@@ -58,7 +51,7 @@ func main() {
 	}
 
 	// Создаём и запускаем приложение.
-	a := app.NewApp(ctx, cancel)
+	a := app.NewApp(ctx, cancel, cfg)
 	if err := a.Run(); err != nil {
 		cancel()
 		logger.Fatal("app init failed", zap.Error(err))

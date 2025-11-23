@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"telegram-userbot/internal/apptime"
-	"telegram-userbot/internal/config"
 	"telegram-userbot/internal/logger"
 
 	"github.com/gotd/td/tg"
@@ -17,8 +15,8 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 	_ = entities // Для совместимости с общей сигнатурой обработчиков команд
 	logger.Info("Auth command received from admin")
 
-	// Проверяем, включен ли веб-сервер
-	if !config.Env().WebServerEnable {
+	// проверяем, включен ли веб-сервер
+	if !h.cfg.GetEnv().WebServerEnable {
 		h.sendReply(ctx, msg, "❌ Web server is disabled. Enable it with WEB_SERVER_ENABLE=true in .env")
 		return
 	}
@@ -43,14 +41,14 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 		logger.Debugf("Auth command rate limited, wait %v", waitTime)
 		return
 	}
-	h.lastAuthTime = apptime.Now()
+	h.lastAuthTime = time.Now()
 	h.authMu.Unlock()
 
 	// Генерируем новый токен
 	token := h.webAuth.GenerateAuthToken()
 
 	// Формируем ссылку
-	webAddr := config.Env().WebServerAddress
+	webAddr := h.cfg.GetEnv().WebServerAddress
 	authURL := fmt.Sprintf("http://%s/?token=%s", webAddr, token)
 
 	// Отправляем ссылку администратору
@@ -111,7 +109,7 @@ func (h *Handlers) sendReply(ctx context.Context, msg *tg.Message, text string) 
 	}
 
 	// Генерируем RandomID для идемпотентности
-	randomID := apptime.Now().UnixNano()
+	randomID := time.Now().UnixNano()
 
 	_, err := h.api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 		Peer:     inputPeer,

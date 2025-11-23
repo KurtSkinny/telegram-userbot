@@ -68,6 +68,7 @@ func (h *lazyUpdateHandler) set(realHandler telegram.UpdateHandler) {
 //   - маршрутизацию апдейтов и регистрацию доменных обработчиков,
 //   - запуск Runner, который оркестрирует жизненный цикл и graceful shutdown.
 type App struct {
+	cfg        *config.Config            // Конфигурация приложения
 	mainCtx    context.Context           // Контекст жизненного цикла приложения.
 	mainCancel context.CancelFunc        // Инициирует отмену mainCtx.
 	filters    *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
@@ -90,8 +91,9 @@ const (
 )
 
 // NewApp создаёт пустой каркас приложения. Фактическая инициализация выполняется в Init().
-func NewApp(mainCtx context.Context, mainCancel context.CancelFunc) *App {
+func NewApp(mainCtx context.Context, mainCancel context.CancelFunc, cfg *config.Config) *App {
 	return &App{
+		cfg:        cfg,
 		mainCtx:    mainCtx,
 		mainCancel: mainCancel,
 	}
@@ -110,13 +112,13 @@ func (a *App) Run() error {
 
 	// 1) Опции MTProto‑клиента: сессии, хуки апдейтов, поведение при dead‑соединении и паспорт устройства.
 	options := telegram.Options{
-		SessionStorage: &session.FileStorage{Path: config.Env().SessionFile},
+		SessionStorage: &session.FileStorage{Path: a.cfg.GetEnv().SessionFile},
 		UpdateHandler:  lazyHandler,
 		Middlewares: []telegram.Middleware{
 			a.waiter,
 			ratelimit.New(
-				rate.Limit(config.Env().ThrottleRPS),
-				config.Env().ThrottleRPS*2, //nolint:mnd // burst = 2*rate
+				rate.Limit(a.cfg.GetEnv().ThrottleRPS),
+				a.cfg.GetEnv().ThrottleRPS*2, //nolint:mnd // burst = 2*rate
 			),
 		},
 		// При сообщении от gotd о «мертвом» соединении отмечаем отключение для зависимых узлов.
@@ -132,14 +134,14 @@ func (a *App) Run() error {
 	}
 
 	// Для тестовых окружений используем DC тестового стенда Telegram.
-	if config.Env().TestDC {
+	if a.cfg.GetEnv().TestDC {
 		options.DCList = dcs.Test()
 	}
 
 	// Инициализация клиента gotd
-	client := telegram.NewClient(config.Env().APIID, config.Env().APIHash, options)
+	client := telegram.NewClient(a.cfg.GetEnv().APIID, a.cfg.GetEnv().APIHash, options)
 
-	peersSvc, peersMgrErr := peersmgr.New(client.API(), config.Env().PeersCacheFile)
+	peersSvc, peersMgrErr := peersmgr.New(client.API(), a.cfg.GetEnv().PeersCacheFile)
 	if peersMgrErr != nil {
 		return fmt.Errorf("init peers manager: %w", peersMgrErr)
 	}
@@ -149,10 +151,10 @@ func (a *App) Run() error {
 	a.peers = peersSvc
 
 	// Инициализация хранилища состояния апдейтов
-	if err := storage.EnsureDir(config.Env().StateFile); err != nil {
+	if err := storage.EnsureDir(a.cfg.GetEnv().StateFile); err != nil {
 		return fmt.Errorf("ensure state file dir: %w", err)
 	}
-	stateStorageBoltdb, err := bbolt.Open(config.Env().StateFile, storage.DefaultFilePerm, nil)
+	stateStorageBoltdb, err := bbolt.Open(a.cfg.GetEnv().StateFile, storage.DefaultFilePerm, nil)
 	if err != nil {
 		return errors.Wrap(err, "create bolt storage")
 	}
@@ -172,34 +174,34 @@ func (a *App) Run() error {
 	lazyHandler.set(realHandler)
 
 	// Инициализация filters
-	a.filters = filters.NewFilterEngine(config.Env().FiltersFile, config.Env().RecipientsFile)
+	a.filters = filters.NewFilterEngine(a.cfg.GetEnv().FiltersFile, a.cfg.GetEnv().RecipientsFile)
 	if filtersErr := a.filters.Load(); filtersErr != nil {
 		return fmt.Errorf("load filters: %w", filtersErr)
 	}
 
 	// Подсистема уведомлений
-	queueStore, err := notifications.NewQueueStore(config.Env().NotifyQueueFile, time.Second)
+	queueStore, err := notifications.NewQueueStore(a.cfg.GetEnv().NotifyQueueFile, time.Second)
 	if err != nil {
 		return fmt.Errorf("init queue store: %w", err)
 	}
-	failedStore, err := notifications.NewFailedStore(config.Env().NotifyFailedFile)
+	failedStore, err := notifications.NewFailedStore(a.cfg.GetEnv().NotifyFailedFile)
 	if err != nil {
 		return fmt.Errorf("init failed store: %w", err)
 	}
 
 	// Таймзона для расписания уведомлений берётся из конфигурации.
-	loc, err := timeutil.ParseLocation(config.Env().NotifyTimezone)
+	loc, err := timeutil.ParseLocation(a.cfg.GetEnv().NotifyTimezone)
 	if err != nil {
 		return fmt.Errorf("load notify timezone: %w", err)
 	}
 
 	// Выбор транспорта уведомлений: client (userbot) или bot (Bot API).
 	var sender notifications.PreparedSender
-	switch config.Env().Notifier {
+	switch a.cfg.GetEnv().Notifier {
 	case notifierClient:
-		sender = telegramnotifier.NewClientSender(client.API(), config.Env().ThrottleRPS, a.peers)
+		sender = telegramnotifier.NewClientSender(client.API(), a.cfg.GetEnv().ThrottleRPS, a.peers)
 	case notifierBot:
-		sender = botapionotifier.NewBotSender(config.Env().BotToken, config.Env().TestDC, config.Env().ThrottleRPS)
+		sender = botapionotifier.NewBotSender(a.cfg.GetEnv().BotToken, a.cfg.GetEnv().TestDC, a.cfg.GetEnv().ThrottleRPS)
 	default:
 		return errors.New(`invalid NOTIFIER option in .env (must be "client" or "bot")`)
 	}
@@ -209,7 +211,7 @@ func (a *App) Run() error {
 		Sender:   sender,
 		Store:    queueStore,
 		Failed:   failedStore,
-		Schedule: config.Env().NotifySchedule,
+		Schedule: a.cfg.GetEnv().NotifySchedule,
 		Location: loc,
 		Clock:    time.Now,
 		Peers:    a.peers,
@@ -220,11 +222,11 @@ func (a *App) Run() error {
 	a.notif = queue
 
 	// Защита от дублей и бурстов правок.
-	a.dupCache = concurrency.NewDeduplicator(config.Env().DedupWindowSec)
-	a.debouncer = concurrency.NewDebouncer(config.Env().DebounceEditMS)
+	a.dupCache = concurrency.NewDeduplicator(a.cfg.GetEnv().DedupWindowSec)
+	a.debouncer = concurrency.NewDebouncer(a.cfg.GetEnv().DebounceEditMS)
 
 	// Регистрация доменных обработчиков, которым нужны API клиента и инфраструктура.
-	h := domainupdates.NewHandlers(client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.mainCancel, a.peers)
+	h := domainupdates.NewHandlers(a.cfg, client.API(), a.filters, a.notif, a.dupCache, a.debouncer, a.mainCancel, a.peers)
 	a.handlers = h
 
 	// Маршрутизация апдейтов на доменные обработчики.
@@ -237,6 +239,7 @@ func (a *App) Run() error {
 	a.runner = NewRunner(
 		a.mainCtx,
 		a.mainCancel,
+		a.cfg,
 		client,
 		a.filters,
 		a.notif,

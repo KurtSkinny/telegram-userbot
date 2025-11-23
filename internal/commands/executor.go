@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"telegram-userbot/internal/apptime"
 	"telegram-userbot/internal/config"
 	"telegram-userbot/internal/filters"
 	"telegram-userbot/internal/logger"
@@ -25,6 +24,7 @@ import (
 
 // CommandExecutor - реализация интерфейса Executor
 type CommandExecutor struct {
+	cfg         *config.Config
 	client      *telegram.Client
 	filters     *filters.FilterEngine
 	notif       *notifications.Queue
@@ -34,12 +34,14 @@ type CommandExecutor struct {
 
 // NewExecutor создает новый экземпляр CommandExecutor
 func NewExecutor(
+	cfg *config.Config,
 	client *telegram.Client,
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
 ) *CommandExecutor {
 	return &CommandExecutor{
+		cfg:     cfg,
 		client:  client,
 		filters: filterEngine,
 		notif:   notif,
@@ -201,12 +203,12 @@ func (e *CommandExecutor) Test(ctx context.Context) (*TestResult, error) {
 		return nil, errors.New("peers manager is not available")
 	}
 
-	adminID := int64(config.Env().AdminUID)
+	adminID := int64(e.cfg.GetEnv().AdminUID)
 	if adminID <= 0 {
 		return nil, errors.New("admin UID is not configured")
 	}
 
-	currentTime := apptime.Now()
+	currentTime := time.Now()
 	message := fmt.Sprintf("Test message from userbot at %s", currentTime.Format(time.RFC3339))
 
 	// Пытаемся отправить сообщение с повторными попытками
@@ -225,8 +227,8 @@ func (e *CommandExecutor) Test(ctx context.Context) (*TestResult, error) {
 		// Формируем получателя
 		recipient := filters.Recipient{Type: filters.RecipientTypeUser, PeerID: filters.RecipientPeerID(adminID)}
 		job := notifications.Job{
-			ID:        apptime.Now().UnixNano(),
-			CreatedAt: apptime.Now(),
+			ID:        time.Now().UnixNano(),
+			CreatedAt: time.Now(),
 		}
 		randomID := notifications.RandomIDForMessage(job, recipient)
 
