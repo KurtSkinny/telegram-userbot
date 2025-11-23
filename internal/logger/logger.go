@@ -99,11 +99,11 @@ func rebuildLoggerLocked() {
 // Init инициализирует глобальный zap-логгер и настраивает уровень.
 // Допустимые уровни: debug, info (по умолчанию), warn, error. Значение сравнивается без учёта регистра.
 // Encoder берётся из defaultEncoderConfig. Потокобезопасно.
-func Init(cfg *config.Config) {
+func Init() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	env := cfg.GetEnv()
+	env := config.Env()
 
 	// Устанавливаем уровень консольного логирования
 	switch strings.ToLower(env.LogLevel) {

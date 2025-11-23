@@ -36,7 +36,6 @@ type WebAuthTokenGenerator interface {
 }
 
 type Handlers struct {
-	cfg       *config.Config            // cfg хранит конфигурацию приложения
 	api       *tg.Client                // api предоставляет доступ к TDLib-клиенту для служебных запросов
 	filters   *filters.FilterEngine     // filters содержит движок фильтров для матчинга сообщений
 	notif     *notifications.Queue      // notif отвечает за доставку уведомлений конечному пользователю
@@ -72,11 +71,10 @@ type Handlers struct {
 //   - NotifiedCacheFile — путь файла для периодического флаша notified-кэша.
 //
 // Возвращает полностью инициализированную структуру без запуска фоновых горутин.
-func NewHandlers(cfg *config.Config, api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
+func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
 	dup *concurrency.Deduplicator, debouncer *concurrency.Debouncer,
 	shutdown func(), peers *peersmgr.Service) *Handlers {
 	return &Handlers{
-		cfg:               cfg,
 		api:               api,
 		filters:           filters,
 		notif:             notif,
@@ -84,9 +82,9 @@ func NewHandlers(cfg *config.Config, api *tg.Client, filters *filters.FilterEngi
 		dupCache:          dup,
 		debouncer:         debouncer,
 		unread:            make(map[int64]int),
-		cleanTTL:          time.Duration(cfg.GetEnv().NotifiedTTLDays) * 24 * time.Hour,
+		cleanTTL:          time.Duration(config.Env().NotifiedTTLDays) * 24 * time.Hour,
 		shutdown:          shutdown,
-		notifiedCacheFile: cfg.GetEnv().NotifiedCacheFile,
+		notifiedCacheFile: config.Env().NotifiedCacheFile,
 		peers:             peers,
 		webAuth:           nil, // будет установлен через SetWebAuth
 	}
@@ -180,7 +178,7 @@ func (h *Handlers) OnNewMessage(
 
 	// Команда auth - генерирует токен для веб-интерфейса
 	if msg.Message == "auth" {
-		adminUID := int64(h.cfg.GetEnv().AdminUID)
+		adminUID := int64(config.Env().AdminUID)
 		if adminUID > 0 && peerID == adminUID {
 			h.handleAuthCommand(ctx, entities, msg)
 			return nil

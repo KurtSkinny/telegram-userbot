@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"telegram-userbot/internal/config"
 	"telegram-userbot/internal/logger"
 
 	"github.com/gotd/td/tg"
@@ -16,7 +17,7 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 	logger.Info("Auth command received from admin")
 
 	// проверяем, включен ли веб-сервер
-	if !h.cfg.GetEnv().WebServerEnable {
+	if !config.Env().WebServerEnable { // Changed h.cfg.GetEnv() to config.Env()
 		h.sendReply(ctx, msg, "❌ Web server is disabled. Enable it with WEB_SERVER_ENABLE=true in .env")
 		return
 	}
@@ -48,7 +49,7 @@ func (h *Handlers) handleAuthCommand(ctx context.Context, entities tg.Entities, 
 	token := h.webAuth.GenerateAuthToken()
 
 	// Формируем ссылку
-	webAddr := h.cfg.GetEnv().WebServerAddress
+	webAddr := config.Env().WebServerAddress
 	authURL := fmt.Sprintf("http://%s/?token=%s", webAddr, token)
 
 	// Отправляем ссылку администратору

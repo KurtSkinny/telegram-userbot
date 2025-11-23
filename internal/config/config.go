@@ -27,6 +27,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var (
+	instance *Config
+	once     sync.Once
+)
+
 // EnvConfig описывает параметры, приходящие из окружения (.env). Это «операционные»
 // настройки запуска: учетные данные и файлы сессии для MTProto, лог-уровень,
 // ограничения по скорости, флаги тестового DC, конфигурация уведомлений и т. д.
@@ -46,7 +51,6 @@ type EnvConfig struct {
 	TestDC         bool
 	BotToken       string
 	AdminUID       int
-	AppTimezone    string
 	FiltersFile    string
 	RecipientsFile string
 	PeersCacheFile string
@@ -94,7 +98,6 @@ const (
 	defaultNotifyQueueFile   = "data/notify_queue.json"
 	defaultNotifyFailedFile  = "data/notify_failed.json"
 	defaultNotifyTimezone    = "Europe/Moscow"
-	defaultAppTimezone       = "Europe/Moscow"
 	defaultNotifiedCacheFile = "data/notified_cache.json"
 	defaultNotifiedTTLDays   = 30
 	defaultFiltersFile       = "assets/filters.json"
@@ -113,14 +116,17 @@ const (
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
 
-// Load читает конфигурацию из .env файла и возвращает новый экземпляр Config.
-// Может быть вызвана многократно для создания разных конфигураций (например, в тестах).
-func Load(envPath string) (*Config, error) {
-	cfg, err := loadConfig(envPath)
+// LoadOnce инициализирует глобальный экземпляр Config из .env файла.
+// Может быть вызвана только один раз благодаря sync.Once.
+func LoadOnce(envPath string) (*Config, error) {
+	var err error
+	once.Do(func() {
+		instance, err = loadConfig(envPath)
+	})
 	if err != nil {
 		return nil, err
 	}
-	return cfg, nil
+	return instance, nil
 }
 
 // loadConfig выполняет фактическую загрузку/валидацию без установки глобального
@@ -162,7 +168,6 @@ func loadConfig(envPath string) (*Config, error) {
 	notifyFailedFile := sanitizeFile("NOTIFY_FAILED_FILE", os.Getenv("NOTIFY_FAILED_FILE"),
 		defaultNotifyFailedFile, &warnings)
 	notifyTimezone := sanitizeTimezoneFlexible(os.Getenv("NOTIFY_TIMEZONE"), defaultNotifyTimezone, &warnings)
-	appTimezone := sanitizeTimezoneFlexible(os.Getenv("APP_TIMEZONE"), defaultAppTimezone, &warnings)
 	notifySchedule := sanitizeSchedule(os.Getenv("NOTIFY_SCHEDULE"), defaultNotifySchedule, &warnings)
 	notifiedCacheFile := sanitizeFile("NOTIFIED_CACHE_FILE", os.Getenv("NOTIFIED_CACHE_FILE"),
 		defaultNotifiedCacheFile, &warnings)
@@ -182,10 +187,6 @@ func loadConfig(envPath string) (*Config, error) {
 	webServerAddress := sanitizeFile("WEB_SERVER_ADDRESS", os.Getenv("WEB_SERVER_ADDRESS"),
 		defaultWebServerAddress, &warnings)
 
-	if err != nil {
-		return nil, fmt.Errorf("invalid APP_TIMEZONE %q: %w", appTimezone, err)
-	}
-
 	env := EnvConfig{
 		APIID:             apiID,
 		APIHash:           apiHash,
@@ -202,7 +203,6 @@ func loadConfig(envPath string) (*Config, error) {
 		Notifier:          notifier,
 		NotifyQueueFile:   notifyQueueFile,
 		NotifyFailedFile:  notifyFailedFile,
-		AppTimezone:       appTimezone,
 		NotifyTimezone:    notifyTimezone,
 		NotifySchedule:    notifySchedule,
 		NotifiedCacheFile: notifiedCacheFile,
@@ -246,6 +246,31 @@ func (c *Config) GetEnv() EnvConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Env
+}
+
+// Env возвращает глобальный EnvConfig.
+// Паникует, если Load еще не был вызван.
+func Env() EnvConfig {
+	if instance == nil {
+		panic("config: Env() called before Load()")
+	}
+	return instance.GetEnv()
+}
+
+// Warnings возвращает накопленные предупреждения из глобального экземпляра.
+// Паникует, если Load еще не был вызван.
+func Warnings() []string {
+	if instance == nil {
+		panic("config: Warnings() called before Load()")
+	}
+	return instance.Warnings()
+}
+
+// Reset сбрасывает глобальный экземпляр Config.
+// Используется только в тестах.
+func Reset() {
+	instance = nil
+	once = sync.Once{}
 }
 
 // parseRequiredInt читает обязательную целочисленную переменную окружения name.

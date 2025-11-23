@@ -24,7 +24,6 @@ import (
 
 // CommandExecutor - реализация интерфейса Executor
 type CommandExecutor struct {
-	cfg         *config.Config
 	client      *telegram.Client
 	filters     *filters.FilterEngine
 	notif       *notifications.Queue
@@ -34,14 +33,12 @@ type CommandExecutor struct {
 
 // NewExecutor создает новый экземпляр CommandExecutor
 func NewExecutor(
-	cfg *config.Config,
 	client *telegram.Client,
 	filterEngine *filters.FilterEngine,
 	notif *notifications.Queue,
 	peers *peersmgr.Service,
 ) *CommandExecutor {
 	return &CommandExecutor{
-		cfg:     cfg,
 		client:  client,
 		filters: filterEngine,
 		notif:   notif,
@@ -203,7 +200,7 @@ func (e *CommandExecutor) Test(ctx context.Context) (*TestResult, error) {
 		return nil, errors.New("peers manager is not available")
 	}
 
-	adminID := int64(e.cfg.GetEnv().AdminUID)
+	adminID := int64(config.Env().AdminUID)
 	if adminID <= 0 {
 		return nil, errors.New("admin UID is not configured")
 	}

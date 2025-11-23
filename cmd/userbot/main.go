@@ -29,15 +29,14 @@ func main() {
 	flag.Parse()
 
 	// config.Load загружает конфигурацию из .env и других источников.
-	cfg, cfgErr := config.Load(*envPath)
-	if cfgErr != nil {
-		logger.Fatal("failed to load config", zap.Error(cfgErr))
+	if _, err := config.LoadOnce(*envPath); err != nil {
+		logger.Fatal("failed to load config", zap.Error(err))
 	}
 
 	// logger.Init задаёт уровень, а SetWriters перенаправляет выводы в подсистему pr (чтобы видеть логи в CLI UI).
-	logger.Init(cfg)
+	logger.Init()
 	logger.SetWriters(pr.Stdout(), pr.Stderr())
-	for _, msg := range cfg.Warnings() {
+	for _, msg := range config.Warnings() {
 		logger.Warn(msg)
 	}
 
@@ -51,7 +50,7 @@ func main() {
 	}
 
 	// Создаём и запускаем приложение.
-	a := app.NewApp(ctx, cancel, cfg)
+	a := app.NewApp(ctx, cancel)
 	if err := a.Run(); err != nil {
 		cancel()
 		logger.Fatal("app init failed", zap.Error(err))

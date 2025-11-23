@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"telegram-userbot/internal/config"
 	"telegram-userbot/internal/logger"
 	"telegram-userbot/internal/timeutil"
 )
@@ -88,7 +89,7 @@ func parsePage(r *http.Request) int {
 
 // readLogs читает логи из файла с пагинацией (100 МБ макс)
 func (s *Server) readLogs(page, pageSize int) ([]LogEntry, int, error) {
-	logFile := s.cfg.GetEnv().LogFile
+	logFile := config.Env().LogFile
 	if logFile == "" {
 		return nil, 0, errors.New("log file not configured")
 	}

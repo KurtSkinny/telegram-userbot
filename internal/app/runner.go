@@ -42,7 +42,6 @@ import (
 //   - корректное завершение: сначала останавливаются сервисы (статусы/очереди), затем гасится MTProto‑движок,
 //   - интеграцию с CLI и доменными обработчиками обновлений.
 type Runner struct {
-	cfg           *config.Config            // Конфигурация приложения
 	client        *telegram.Client          // Обёртка над MTProto‑клиентом и API: логин, Self(), API-интерфейс.
 	filters       *filters.FilterEngine     // Движок фильтров: загрузка, хранение, матчи.
 	notif         *notifications.Queue      // Асинхронная очередь нотификаций (доставка сообщений администратору/сервисам).
@@ -68,7 +67,6 @@ const (
 func NewRunner(
 	mainCtx context.Context,
 	mainCancel context.CancelFunc,
-	cfg *config.Config,
 	client *telegram.Client,
 	filters *filters.FilterEngine,
 	notif *notifications.Queue,
@@ -78,7 +76,6 @@ func NewRunner(
 	peers *peersmgr.Service,
 ) *Runner {
 	return &Runner{
-		cfg:        cfg,
 		mainCtx:    mainCtx,
 		mainCancel: mainCancel,
 		client:     client,
@@ -137,7 +134,7 @@ func (r *Runner) Run(waiter *floodwait.Waiter, updmgr *tgupdates.Manager) error 
 func (r *Runner) loginSelf(ctx context.Context) (*tg.User, error) {
 	// 2) Готовим интерактивный сценарий
 	flow := auth.NewFlow(
-		telegramauth.TerminalAuthenticator{PhoneNumber: r.cfg.GetEnv().PhoneNumber},
+		telegramauth.TerminalAuthenticator{PhoneNumber: config.Env().PhoneNumber},
 		auth.SendCodeOptions{},
 	)
 
@@ -165,7 +162,7 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 
 	if err := r.peers.Mgr.Init(ctx); err != nil {
 		logger.Errorf("failed to init peers manager: %v", err)
-		if r.cfg.GetEnv().Notifier == notifierClient {
+		if config.Env().Notifier == notifierClient {
 			return err
 		}
 	}
@@ -176,7 +173,7 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 
 	if err := r.peers.WarmupIfEmpty(ctx, r.client.API()); err != nil {
 		logger.Errorf("failed to warm up peers manager: %v", err)
-		if r.cfg.GetEnv().Notifier == notifierClient {
+		if config.Env().Notifier == notifierClient {
 			logger.Error("peers warmup error, cant use client notifier")
 			return err
 		}
@@ -189,7 +186,7 @@ func (r *Runner) initPeersIfNeeded(ctx context.Context) error {
 func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager, selfID int64) error {
 	// command executor
 	logger.Debug("initializing command executor")
-	r.cmdExecutor = commands.NewExecutor(r.cfg, r.client, r.filters, r.notif, r.peers)
+	r.cmdExecutor = commands.NewExecutor(r.client, r.filters, r.notif, r.peers)
 	logger.Debug("command executor initialized")
 
 	// cli
@@ -199,9 +196,9 @@ func (r *Runner) startAllServices(ctx context.Context, updmgr *tgupdates.Manager
 	logger.Debug("service cli started")
 
 	// web server (если включен)
-	if r.cfg.GetEnv().WebServerEnable {
+	if config.Env().WebServerEnable {
 		logger.Debug("starting service web_server")
-		r.webServer = web.NewServer(r.cfg, r.cmdExecutor)
+		r.webServer = web.NewServer(r.cmdExecutor)
 
 		// Передаем webServer в handlers для генерации auth токенов
 		r.handlers.SetWebAuth(r.webServer)
@@ -348,7 +345,7 @@ func (r *Runner) stopAllServices() {
 //   - отправка сервисного уведомления (оставлено закомментированным, но готово к использованию).
 func (r *Runner) handleUpdatesManagerStart(ctx context.Context) {
 	// переходим в онлайн, если notifier == "client"
-	if r.cfg.GetEnv().Notifier == "client" {
+	if config.Env().Notifier == "client" {
 		status.GoOnline()
 	}
 
