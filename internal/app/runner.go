@@ -11,20 +11,20 @@ import (
 	"sync"
 	"time"
 
-	"telegram-userbot/internal/adapters/cli"
-	"telegram-userbot/internal/adapters/telegram/core"
-	"telegram-userbot/internal/adapters/web"
-	"telegram-userbot/internal/domain/commands"
-	"telegram-userbot/internal/domain/filters"
-	"telegram-userbot/internal/domain/notifications"
-	domainupdates "telegram-userbot/internal/domain/updates"
-	"telegram-userbot/internal/infra/concurrency"
-	"telegram-userbot/internal/infra/config"
-	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/telegram/connection"
-	"telegram-userbot/internal/infra/telegram/peersmgr"
+	"telegram-userbot/internal/cli"
+	"telegram-userbot/internal/commands"
+	"telegram-userbot/internal/concurrency"
+	"telegram-userbot/internal/config"
+	"telegram-userbot/internal/filters"
+	"telegram-userbot/internal/logger"
+	"telegram-userbot/internal/notifications"
+	telegramauth "telegram-userbot/internal/telegram/auth"
+	"telegram-userbot/internal/telegram/connection"
+	"telegram-userbot/internal/telegram/peersmgr"
+	domainupdates "telegram-userbot/internal/updates"
+	"telegram-userbot/internal/web"
 
-	"telegram-userbot/internal/infra/telegram/status"
+	"telegram-userbot/internal/telegram/status"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/middleware/floodwait"
@@ -134,7 +134,7 @@ func (r *Runner) Run(waiter *floodwait.Waiter, updmgr *tgupdates.Manager) error 
 func (r *Runner) loginSelf(ctx context.Context) (*tg.User, error) {
 	// 2) Готовим интерактивный сценарий
 	flow := auth.NewFlow(
-		core.TerminalAuthenticator{PhoneNumber: config.Env().PhoneNumber},
+		telegramauth.TerminalAuthenticator{PhoneNumber: config.Env().PhoneNumber},
 		auth.SendCodeOptions{},
 	)
 

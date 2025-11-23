@@ -12,9 +12,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/pr"
-	"telegram-userbot/internal/infra/telegram/peersmgr"
+	"telegram-userbot/internal/logger"
+	"telegram-userbot/internal/pr"
+	"telegram-userbot/internal/telegram/peersmgr"
 	"unicode/utf8"
 
 	tdpeers "github.com/gotd/td/telegram/peers"

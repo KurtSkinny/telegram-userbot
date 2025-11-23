@@ -11,11 +11,11 @@ import (
 	"go.uber.org/zap"
 
 	"telegram-userbot/internal/app"
-	"telegram-userbot/internal/infra/concurrency"
-	"telegram-userbot/internal/infra/config"
-	"telegram-userbot/internal/infra/logger"
-	"telegram-userbot/internal/infra/pr"
-	"telegram-userbot/internal/infra/timeutil"
+	"telegram-userbot/internal/concurrency"
+	"telegram-userbot/internal/config"
+	"telegram-userbot/internal/logger"
+	"telegram-userbot/internal/pr"
+	"telegram-userbot/internal/timeutil"
 )
 
 func main() {

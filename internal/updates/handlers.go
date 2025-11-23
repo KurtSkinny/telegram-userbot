@@ -1,0 +1,309 @@
+// Package updates содержит обработчики входящих событий Telegram и связывает
+// транспортный слой (tg.* updates) с бизнес-логикой уведомлений. В рамках
+// пакета решаются задачи:
+//  1. фильтрация сообщений по заданным правилам (internal/domain/filters),
+//  2. идемпотентная доставка уведомлений (notified-кэш + очередь уведомлений),
+//  3. защита от повторной обработки (Deduplicator по peerID/msgID/EditDate),
+//  4. сглаживание всплесков при частых правках одного сообщения (Debouncer),
+//  5. поддержание локальных счетчиков непрочитанного для эвристик.
+//
+// Пакет не отправляет сообщения сам по себе — он формирует и ставит задачи в
+// очередь уведомлений, а также ведет кэш «что уже уведомляли», чтобы не
+// дублировать рассылку при редактированиях и повторных апдейтах от Telegram.
+package updates
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"telegram-userbot/internal/concurrency"
+	"telegram-userbot/internal/filters"
+	"telegram-userbot/internal/logger"
+	"telegram-userbot/internal/notifications"
+	"telegram-userbot/internal/support/debug"
+	"telegram-userbot/internal/telegram/peersmgr"
+	"telegram-userbot/internal/tgutil"
+
+	"telegram-userbot/internal/config"
+
+	"github.com/gotd/td/tg"
+)
+
+// WebAuthTokenGenerator интерфейс для генерации токенов авторизации
+type WebAuthTokenGenerator interface {
+	GenerateAuthToken() string
+}
+
+type Handlers struct {
+	api       *tg.Client                // api предоставляет доступ к TDLib-клиенту для служебных запросов
+	filters   *filters.FilterEngine     // filters содержит движок фильтров для матчинга сообщений
+	notif     *notifications.Queue      // notif отвечает за доставку уведомлений конечному пользователю
+	notified  map[string]time.Time      // notified запоминает, какие комбинации «сообщение-фильтр» уже уведомлялись
+	mu        sync.Mutex                // mu защищает доступ к карте notified в конкурентной среде
+	dupCache  *concurrency.Deduplicator // dupCache предотвращает повторную обработку одинаковых сообщений
+	debouncer *concurrency.Debouncer    // debouncer сглаживает частые обновления одного сообщения (редактирования)
+	unread    map[int64]int             // unread хранит счётчики непрочитанных сообщений по пирами
+	unreadMu  sync.Mutex                // unreadMu синхронизирует конкурентные обновления карты unread
+	peers     *peersmgr.Service         // peers предоставляет доступ к менеджеру пиров и локальному снапшоту
+
+	webAuth      WebAuthTokenGenerator // webAuth генерирует токены для веб-интерфейса
+	lastAuthTime time.Time             // lastAuthTime хранит время последней авторизации через веб
+	authMu       sync.Mutex            // authMu защищает доступ к lastAuthTime в конкурентной среде
+
+	notifiedCacheFile string
+	notifiedDirty     bool
+	notifiedSaveTimer *time.Timer
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	cleanTTL  time.Duration
+
+	shutdown context.CancelFunc
+}
+
+// NewHandlers подготавливает инстанс обработчиков: связывает Telegram-клиента,
+// очередь уведомлений и утилиты конкурентного доступа (дедупликатор,
+// дебаунсер). Значимые параметры берутся из конфигурации окружения:
+//   - NotifiedTTLDays — срок хранения отметок «уже уведомлено»;
+//   - NotifiedCacheFile — путь файла для периодического флаша notified-кэша.
+//
+// Возвращает полностью инициализированную структуру без запуска фоновых горутин.
+func NewHandlers(api *tg.Client, filters *filters.FilterEngine, notif *notifications.Queue,
+	dup *concurrency.Deduplicator, debouncer *concurrency.Debouncer,
+	shutdown func(), peers *peersmgr.Service) *Handlers {
+	cfg := config.Env()
+	return &Handlers{
+		api:               api,
+		filters:           filters,
+		notif:             notif,
+		notified:          make(map[string]time.Time),
+		dupCache:          dup,
+		debouncer:         debouncer,
+		unread:            make(map[int64]int),
+		cleanTTL:          time.Duration(cfg.NotifiedTTLDays) * 24 * time.Hour,
+		shutdown:          shutdown,
+		notifiedCacheFile: cfg.NotifiedCacheFile,
+		peers:             peers,
+		webAuth:           nil, // будет установлен через SetWebAuth
+	}
+}
+
+// SetWebAuth устанавливает генератор токенов для веб-интерфейса
+func (h *Handlers) SetWebAuth(webAuth WebAuthTokenGenerator) {
+	h.webAuth = webAuth
+}
+
+// Start запускает фоновые воркеры и восстанавливает состояние notified-кэша.
+// Последовательность:
+//  1. опционально переопределяет TTL очистки, если передан аргумент > 0;
+//  2. загружает кэш notified с диска (best-effort, ошибки не критичны);
+//  3. поднимает контекст отмены и стартует:
+//     - планировщик отметок прочитанного (runMarkReadScheduler),
+//     - сборщик мусора для notified (runNotificationCacheCleaner).
+//
+// Повторные вызовы безопасны и игнорируются (startOnce).
+func (h *Handlers) Start(ctx context.Context, cleanTTL time.Duration) {
+	if ctx == nil {
+		return
+	}
+
+	h.startOnce.Do(func() {
+		if cleanTTL > 0 {
+			h.cleanTTL = cleanTTL
+		}
+		// загрузка кэша notified с диска
+		h.loadNotifiedFromDisk()
+
+		runCtx, cancel := context.WithCancel(ctx)
+		h.cancel = cancel
+
+		h.wg.Go(func() {
+			h.runMarkReadScheduler(runCtx)
+		})
+
+		h.wg.Go(func() {
+			h.runNotificationCacheCleaner(runCtx)
+		})
+	})
+}
+
+// Stop корректно останавливает запущенные воркеры: вызывает cancel контекста,
+// дожидается завершения горутин и делает принудительный флаш notified-кэша на
+// диск. Повторные вызовы безопасны и игнорируются (stopOnce).
+func (h *Handlers) Stop() {
+	h.stopOnce.Do(func() {
+		if h.cancel != nil {
+			h.cancel()
+		}
+		h.wg.Wait()
+		// Финальный флаш кэша notified на диск
+		h.flushNotifiedNow()
+	})
+}
+
+// OnNewMessage обрабатывает входящее личное или групповое сообщение.
+// Проверяет, не было ли сообщение уже обработано (Deduplicator по
+// комбинации peerID/msgID/editDate). Если новое — прогоняет через
+// фильтры, ставит уведомления и помечает в кэше notified.
+// Обновляет локальный счётчик непрочитанного для эвристик.
+func (h *Handlers) OnNewMessage(
+	ctx context.Context,
+	entities tg.Entities,
+	u *tg.UpdateNewMessage,
+) error {
+	msg, ok := u.Message.(*tg.Message)
+	if !ok || msg.Out {
+		return nil
+	}
+
+	peerID := tgutil.GetPeerID(msg.PeerID)
+
+	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
+		return nil
+	}
+
+	// Сервисный триггер: входящее сообщение с текстом "Exit" инициирует graceful shutdown.
+	if msg.Message == "Exit" {
+		logger.Info("Shutdown requested via incoming message")
+		// if h.cancel != nil {
+		// 	h.cancel()
+		// }
+		if h.shutdown != nil {
+			h.shutdown()
+		}
+		return nil
+	}
+
+	// Команда auth - генерирует токен для веб-интерфейса
+	if msg.Message == "auth" {
+		adminUID := int64(config.Env().AdminUID)
+		if adminUID > 0 && peerID == adminUID {
+			h.handleAuthCommand(ctx, entities, msg)
+			return nil
+		}
+	}
+
+	logger.Debug("OnNewMessage")
+	debug.PrintUpdate("DM/Group", msg, entities, h.peers)
+	results := h.filters.ProcessMessage(entities, msg)
+	for _, res := range results {
+		if h.hasNotified(msg, res.Filter.ID) {
+			continue
+		}
+		if err := h.notif.Notify(entities, msg, res); err != nil {
+			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
+			logger.Errorf("notify enqueue error: %v", err)
+			continue
+		}
+		h.markNotified(msg, res.Filter.ID)
+	}
+	// Обновляем локальный счётчик "непрочитанных" для дальнейших эвристик.
+	h.setUnreadCache(peerID, msg.ID)
+	return nil
+}
+
+// OnNewChannelMessage обрабатывает входящее сообщение из канала. Логика
+// идентична личным/групповым сообщениям: прогрев кэша, дедупликация,
+// фильтрация, идемпотентная постановка уведомлений и обновление счётчиков.
+func (h *Handlers) OnNewChannelMessage(
+	ctx context.Context,
+	entities tg.Entities,
+	u *tg.UpdateNewChannelMessage,
+) error {
+	msg, ok := u.Message.(*tg.Message)
+	if !ok || msg.Out {
+		return nil
+	}
+
+	peerID := tgutil.GetPeerID(msg.PeerID)
+
+	if h.dupCache.DedupSeen(peerID, msg.ID, msg.EditDate) {
+		return nil
+	}
+	logger.Debug("OnNewChannelMessage")
+	debug.PrintUpdate("Channel", msg, entities, h.peers)
+	results := h.filters.ProcessMessage(entities, msg)
+	for _, res := range results {
+		if h.hasNotified(msg, res.Filter.ID) {
+			continue
+		}
+		if err := h.notif.Notify(entities, msg, res); err != nil {
+			// Ошибка здесь — редкая валидационная (nil msg / пустые получатели). Не помечаем.
+			logger.Errorf("notify enqueue error: %v", err)
+			continue
+		}
+		h.markNotified(msg, res.Filter.ID)
+	}
+	h.setUnreadCache(peerID, msg.ID)
+	return nil
+}
+
+// OnEditMessage обрабатывает редактирование личных и групповых сообщений.
+// Логика: дебаунс правок, проверка на дедупликацию, повторный прогон через
+// фильтры и, при наличии новых матчей, постановка уведомлений с отметкой notified.
+func (h *Handlers) OnEditMessage(
+	ctx context.Context,
+	entities tg.Entities,
+	u *tg.UpdateEditMessage,
+) error {
+	msg, ok := u.Message.(*tg.Message)
+	if !ok || msg.Out {
+		return nil
+	}
+	// logger.Warnf("msg: %v", pr.Pf(msg))
+	logger.Debug("OnEditMessage")
+	debug.PrintUpdate("OnEditMessage", msg, entities, h.peers)
+	// Дебаунсим лавину апдейтов при частых правках одного и того же сообщения.
+	h.debouncer.Do(msg.ID, func() {
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+			results := h.filters.ProcessMessage(entities, msg)
+			for _, res := range results {
+				if h.hasNotified(msg, res.Filter.ID) {
+					continue
+				}
+				if err := h.notif.Notify(entities, msg, res); err != nil {
+					logger.Errorf("notify enqueue error: %v", err)
+					continue
+				}
+				h.markNotified(msg, res.Filter.ID)
+			}
+		}
+	})
+	return nil
+}
+
+// OnEditChannelMessage обрабатывает редактирование сообщений в каналах.
+// Логика: дебаунс правок, проверка на дедупликацию, повторный прогон через
+// фильтры и, при наличии новых матчей, постановка уведомлений с отметкой notified.
+func (h *Handlers) OnEditChannelMessage(
+	ctx context.Context,
+	entities tg.Entities,
+	u *tg.UpdateEditChannelMessage,
+) error {
+	msg, ok := u.Message.(*tg.Message)
+	if !ok || msg.Out {
+		return nil
+	}
+	logger.Debug("OnEditChannelMessage")
+	debug.PrintUpdate("OnEditChannelMessage", msg, entities, h.peers)
+	// Дебаунсим частые правки сообщений канала, чтобы не заспамить очередь.
+	h.debouncer.Do(msg.ID, func() {
+		if !h.dupCache.DedupSeen(tgutil.GetPeerID(msg.PeerID), msg.ID, msg.EditDate) {
+			results := h.filters.ProcessMessage(entities, msg)
+			for _, res := range results {
+				if h.hasNotified(msg, res.Filter.ID) {
+					continue
+				}
+				if err := h.notif.Notify(entities, msg, res); err != nil {
+					logger.Errorf("notify enqueue error: %v", err)
+					continue
+				}
+				h.markNotified(msg, res.Filter.ID)
+			}
+		}
+	})
+	return nil
+}
