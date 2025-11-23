@@ -1,16 +1,4 @@
-// Пакет config отвечает за сбор и предоставление конфигурации всего приложения
-// (userbot на MTProto). Он:
-//  1. читает переменные окружения из .env (через godotenv),
-//  2. загружает правила фильтрации из JSON-файла (filters.json),
-//  3. нормализует и валидирует входные значения,
-//  4. кеширует производные структуры (например, множество уникальных чатов),
-//  5. предоставляет потокобезопасный доступ к результатам через R/W мьютекс.
-//
-// Бизнес-контекст: фильтры описывают, какие входящие сообщения нас интересуют
-// (по словам, по регулярным выражениям и т. п.), из каких чатов их брать и куда
-// слать уведомления (клиентом или ботом). Конфиг среды управляет подключением к
-// Telegram API, скоростными лимитами, логированием, часовой зоной уведомлений и
-// прочими «ручками».
+// config отвечает за загрузку и хранение конфигурации приложения.
 package config
 
 import (
@@ -32,12 +20,6 @@ var (
 	once     sync.Once
 )
 
-// EnvConfig описывает параметры, приходящие из окружения (.env). Это «операционные»
-// настройки запуска: учетные данные и файлы сессии для MTProto, лог-уровень,
-// ограничения по скорости, флаги тестового DC, конфигурация уведомлений и т. д.
-//
-// NB: значения уже проходят минимальную валидацию и нормализацию в loadConfig.
-// В рантайме по месту использования предполагается, что EnvConfig последователен.
 type EnvConfig struct {
 	APIID          int
 	APIHash        string
@@ -75,17 +57,12 @@ type EnvConfig struct {
 	WebServerAddress string
 }
 
-// Config хранит конфигурацию среды.
-//
-// Потокобезопасность: публичные геттеры берут RLock. Перезагрузка фильтров
-// (loadFilters) держит эксклюзивный Lock на время обновления полей.
 type Config struct {
 	Env      EnvConfig
 	warnings []string     // предупреждения, накопленные при чтении окружения
 	mu       sync.RWMutex // защита конкурентного доступа к конфигурации
 }
 
-// Значения по умолчанию для параметров окружения и связанных файлов.
 const (
 	defaultThrottleRPS       = 1
 	defaultDedupWindowSec    = 120
@@ -116,8 +93,7 @@ const (
 
 var defaultNotifySchedule = []string{"08:00", "17:00"}
 
-// LoadOnce инициализирует глобальный экземпляр Config из .env файла.
-// Может быть вызвана только один раз благодаря sync.Once.
+// LoadOnce загружает конфигурацию из .env файла.
 func LoadOnce(envPath string) (*Config, error) {
 	var err error
 	once.Do(func() {
@@ -129,8 +105,7 @@ func LoadOnce(envPath string) (*Config, error) {
 	return instance, nil
 }
 
-// loadConfig выполняет фактическую загрузку/валидацию без установки глобального
-// состояния. Удобно для тестов: можно собрать временный Config и проверить его.
+// loadConfig загружает конфигурацию из .env файла.
 func loadConfig(envPath string) (*Config, error) {
 	if err := godotenv.Load(envPath); err != nil {
 		return nil, fmt.Errorf("failed to load .env: %w", err)
@@ -240,8 +215,7 @@ func (c *Config) Warnings() []string {
 	return result
 }
 
-// GetEnv возвращает EnvConfig из этого экземпляра Config. Это неизменяемый снимок
-// на момент последней загрузки; для обновления надо перечитать конфиг целиком.
+// GetEnv возвращает EnvConfig из этого экземпляра Config.
 func (c *Config) GetEnv() EnvConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -249,7 +223,6 @@ func (c *Config) GetEnv() EnvConfig {
 }
 
 // Env возвращает глобальный EnvConfig.
-// Паникует, если Load еще не был вызван.
 func Env() EnvConfig {
 	if instance == nil {
 		panic("config: Env() called before Load()")
@@ -258,7 +231,6 @@ func Env() EnvConfig {
 }
 
 // Warnings возвращает накопленные предупреждения из глобального экземпляра.
-// Паникует, если Load еще не был вызван.
 func Warnings() []string {
 	if instance == nil {
 		panic("config: Warnings() called before Load()")
@@ -267,7 +239,6 @@ func Warnings() []string {
 }
 
 // Reset сбрасывает глобальный экземпляр Config.
-// Используется только в тестах.
 func Reset() {
 	instance = nil
 	once = sync.Once{}
@@ -275,7 +246,6 @@ func Reset() {
 
 // parseRequiredInt читает обязательную целочисленную переменную окружения name.
 // Если переменная не задана или не является корректным числом — возвращает ошибку.
-// Используется для критичных параметров, без которых приложение не стартует.
 func parseRequiredInt(name string) (int, error) {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -290,7 +260,6 @@ func parseRequiredInt(name string) (int, error) {
 
 // parseIntDefault читает name как int. Если пусто/некорректно/не проходит
 // дополнительную проверку validator — возвращает defaultVal и пишет предупреждение.
-// Это позволяет не падать на несущественных настройках и иметь дефолты.
 func parseIntDefault(name string, defaultVal int, validator func(int) bool, warnings *[]string) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -318,8 +287,7 @@ func appendWarningf(warnings *[]string, format string, args ...any) {
 	*warnings = append(*warnings, fmt.Sprintf(format, args...))
 }
 
-// greaterThanZero/ nonNegative — простые валидаторы чисел. Используются в
-// parseIntDefault, чтобы навязать смысловые ограничения без падения приложения.
+// greaterThanZero/nonNegative — простые валидаторы чисел.
 func greaterThanZero(v int) bool { return v > 0 }
 func nonNegative(v int) bool     { return v >= 0 }
 
