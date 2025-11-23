@@ -5,7 +5,7 @@ package status
 
 import (
 	"context"
-	"telegram-userbot/internal/shared"
+	"math/rand/v2"
 	tgruntime "telegram-userbot/internal/telegram/runtime"
 
 	"github.com/gotd/td/tg"
@@ -23,7 +23,7 @@ func DoTypingWaitMs(ctx context.Context, peer tg.InputPeerClass, minMs, maxMs in
 		return
 	}
 	// Добавляем хвост, чтобы аккаунт не выключал online ровно в момент окончания печати.
-	deltaMs := shared.Random(deltaMinMs, deltaMaxMs)
+	deltaMs := rand.IntN(deltaMaxMs-deltaMinMs+1) + deltaMinMs // #nosec G404
 	goOnlineInterval(deltaMs+minMs, deltaMs+maxMs)
 	// Включаем typing через API; ошибки намеренно глотаем — это косметика.
 	_, _ = manager.client.API().MessagesSetTyping(ctx, &tg.MessagesSetTypingRequest{
